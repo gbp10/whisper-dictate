@@ -1,0 +1,7 @@
+#!/bin/bash
+# WhisperDictate launcher - runs the Python script with the correct environment
+
+export PATH="/opt/homebrew/bin:/usr/local/bin:$PATH"
+
+cd /Users/gerardob/whisper-dictate
+exec /Users/gerardob/whisper-official/bin/python3 /Users/gerardob/whisper-dictate/dictate.py

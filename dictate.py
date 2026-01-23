@@ -211,24 +211,74 @@ class WhisperDictate:
 
         return trimmed
 
+    def _get_available_input_devices(self):
+        """Get list of available input devices, sorted by preference"""
+        devices = []
+        try:
+            all_devices = sd.query_devices()
+            for i, dev in enumerate(all_devices):
+                if dev['max_input_channels'] > 0:
+                    # Prioritize: MacBook mic > other mics > virtual devices
+                    priority = 0
+                    name_lower = dev['name'].lower()
+                    if 'macbook' in name_lower:
+                        priority = 100
+                    elif 'airpods' in name_lower or 'headphone' in name_lower:
+                        priority = 90
+                    elif 'iphone' in name_lower:
+                        priority = 80
+                    elif 'teams' in name_lower or 'zoom' in name_lower:
+                        priority = 10  # Virtual devices as last resort
+                    else:
+                        priority = 50
+                    devices.append((priority, i, dev['name']))
+            # Sort by priority descending
+            devices.sort(key=lambda x: -x[0])
+        except Exception as e:
+            logger.error(f"Error querying devices: {e}")
+        return devices
+
     def start_recording(self):
-        """Start recording audio"""
+        """Start recording audio with automatic device fallback"""
         if self.recording:
             return
         self.audio_data = []
         self.recording = True
-        try:
-            self.stream = sd.InputStream(
-                samplerate=SAMPLE_RATE,
-                channels=1,
-                dtype=np.float32,
-                callback=self.audio_callback
-            )
-            self.stream.start()
-            logger.info("Recording... (release Ctrl+Space to stop)")
-        except Exception as e:
-            logger.error(f"Error starting recording: {e}")
-            self.recording = False
+
+        # Try default device first, then fallback to others
+        devices_to_try = [(None, "default")]  # None = use system default
+
+        # Add fallback devices
+        for priority, device_id, name in self._get_available_input_devices():
+            devices_to_try.append((device_id, name))
+
+        last_error = None
+        for device_id, device_name in devices_to_try:
+            try:
+                self.stream = sd.InputStream(
+                    samplerate=SAMPLE_RATE,
+                    channels=1,
+                    dtype=np.float32,
+                    callback=self.audio_callback,
+                    device=device_id  # None = default
+                )
+                self.stream.start()
+                if device_id is not None:
+                    logger.info(f"Recording with fallback device: {device_name}")
+                else:
+                    logger.info("Recording... (release Ctrl+Space to stop)")
+                return  # Success
+            except Exception as e:
+                last_error = e
+                if device_id is None:
+                    logger.warning(f"Default audio device failed: {e}")
+                else:
+                    logger.debug(f"Device '{device_name}' failed: {e}")
+                continue
+
+        # All devices failed
+        logger.error(f"All audio devices failed. Last error: {last_error}")
+        self.recording = False
 
     def stop_recording(self):
         """Stop recording and transcribe"""

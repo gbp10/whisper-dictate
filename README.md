@@ -6,107 +6,152 @@ A simple, free, and local voice dictation tool for macOS using OpenAI's Whisper 
 
 ## Features
 
-- 🎤 Hold-to-record hotkey (Ctrl+Space)
-- 🔒 100% local - your voice never leaves your machine
-- 📋 Auto-pastes transcribed text at cursor position
-- 🚀 Runs in background, starts on boot
-- 🔇 Automatic silence trimming
+- Hold-to-record hotkey (Ctrl+Space)
+- 100% local - your voice never leaves your machine
+- Auto-pastes transcribed text at cursor position
+- Runs in background via launchd, starts on boot
+- Automatic silence trimming
+- Log rotation (max 1MB, keeps 3 backups)
 
 ## Requirements
 
 - macOS (Apple Silicon or Intel)
 - Python 3.9+
 - ~1GB disk space for the Whisper model
+- ffmpeg (installed automatically)
 
-## Installation
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/gbp10/whisper-dictate/main/install.sh | bash
-```
-
-Or manually:
+## Quick Start
 
 ```bash
-git clone https://github.com/gbp10/whisper-dictate.git
-cd whisper-dictate
-chmod +x install.sh
-./install.sh
+# Start manually
+~/bin/run_whisper_dictate.sh start
+
+# Check status
+~/bin/run_whisper_dictate.sh status
+
+# View logs
+~/bin/run_whisper_dictate.sh logs
+
+# Stop
+~/bin/run_whisper_dictate.sh stop
+
+# Restart
+~/bin/run_whisper_dictate.sh restart
 ```
 
-## Permissions Required
+## Permissions Required (IMPORTANT)
 
-After installation, grant these permissions in **System Settings → Privacy & Security**:
+After installation, you MUST grant these permissions in **System Settings -> Privacy & Security**:
 
-- **Accessibility**: Enable for Terminal (or your terminal app)
-- **Microphone**: Enable for Terminal (or your terminal app)
+### 1. Accessibility (Required for Hotkey)
+
+The Python app needs Accessibility permission to monitor keyboard events (Ctrl+Space).
+
+1. Open **System Settings -> Privacy & Security -> Accessibility**
+2. Click the **+** button
+3. Navigate to: `/opt/homebrew/Cellar/python@3.14/3.14.0_1/Frameworks/Python.framework/Versions/3.14/Resources/Python.app`
+   - Or simply add **Terminal.app** (easier)
+4. Enable the checkbox
+
+### 2. Microphone (Required for Recording)
+
+1. Open **System Settings -> Privacy & Security -> Microphone**
+2. Enable for **Terminal.app** (or your terminal)
 
 ## Usage
 
 1. Hold **Ctrl+Space** to start recording
-2. Speak
+2. Speak clearly
 3. Release **Ctrl+Space** to transcribe
 4. Text is automatically pasted at your cursor
 
-## Commands
+## Service Management
+
+The service runs as a launchd agent that starts automatically on login.
 
 ```bash
-# Start manually
-~/bin/run_whisper_dictate.sh
+# Manual control
+~/bin/run_whisper_dictate.sh start|stop|restart|status|logs
 
-# Check if running
-ps aux | grep dictate
-
-# Stop
-pkill -f dictate.py
-
-# View logs
-tail -f ~/Library/Logs/whisper_dictate.log
+# Or use launchctl directly
+launchctl load ~/Library/LaunchAgents/com.gerardob.whisperdictate.plist
+launchctl unload ~/Library/LaunchAgents/com.gerardob.whisperdictate.plist
 ```
-
-## Auto-Start on Login
-
-1. Open **System Settings → General → Login Items**
-2. Click **+** under "Open at Login"
-3. Press **Cmd+Shift+G** and enter: `~/bin`
-4. Select `run_whisper_dictate.sh`
 
 ## Configuration
 
-Edit `~/whisper-dictate/dictate.py` to change:
+Edit `~/whisper-dictate/dictate.py` to change settings:
 
 | Setting | Default | Options |
 |---------|---------|---------|
 | `MODEL_NAME` | `medium` | `tiny`, `base`, `small`, `medium`, `large` |
 | `LANGUAGE` | `en` | `en`, `es`, `fr`, `de`, `it`, `None` (auto-detect) |
 | `SILENCE_THRESHOLD` | `0.01` | Lower = more sensitive |
+| `LOG_MAX_BYTES` | `1MB` | Max log file size before rotation |
 
-After editing, restart:
+After editing, restart the service:
 
 ```bash
-pkill -f dictate.py && ~/bin/run_whisper_dictate.sh
+~/bin/run_whisper_dictate.sh restart
 ```
 
 ## Model Comparison
 
-| Model | Size | Speed | Accuracy |
-|-------|------|-------|----------|
-| `tiny` | 39 MB | Fastest | Basic |
-| `base` | 74 MB | Fast | Good |
-| `small` | 244 MB | Medium | Better |
-| `medium` | 769 MB | Slow | High |
-| `large` | 1.5 GB | Slowest | Highest |
+| Model | Size | Speed | Accuracy | RAM Usage |
+|-------|------|-------|----------|-----------|
+| `tiny` | 39 MB | Fastest | Basic | ~1 GB |
+| `base` | 74 MB | Fast | Good | ~1 GB |
+| `small` | 244 MB | Medium | Better | ~2 GB |
+| `medium` | 769 MB | Slow | High | ~5 GB |
+| `large` | 1.5 GB | Slowest | Highest | ~10 GB |
+
+## File Locations
+
+```
+~/whisper-dictate/
+├── dictate.py              # Main script
+├── dictate.log             # Current log (rotates at 1MB)
+├── dictate.log.1           # Backup log 1
+├── dictate.log.2           # Backup log 2
+├── dictate.log.3           # Backup log 3
+├── .dictate.pid            # PID file for launcher
+└── README.md               # This file
+
+~/whisper-official/          # Python virtual environment
+~/bin/run_whisper_dictate.sh # Launcher script
+~/Library/LaunchAgents/com.gerardob.whisperdictate.plist  # launchd config
+```
 
 ## Troubleshooting
 
-**"Audio level too low"**
-- Check microphone permissions in System Settings
-- Make sure correct input device is selected
+### "This process is not trusted"
+- Add Python.app or Terminal.app to **Accessibility** in System Settings
 
-**"This process is not trusted"**
-- Add Terminal to Accessibility in System Settings
+### "Audio level too low"
+- Check **Microphone** permission in System Settings
+- Verify correct input device is selected in Sound settings
 
-**Multiple instances running**
-- Run: `pkill -9 -f dictate.py && ~/bin/run_whisper_dictate.sh`
+### Hotkey not working
+- Ensure Accessibility permission is granted
+- Check if another app is using Ctrl+Space
+
+### Multiple instances running
+```bash
+pkill -9 -f dictate.py
+~/bin/run_whisper_dictate.sh start
+```
+
+### View detailed logs
+```bash
+tail -f ~/whisper-dictate/dictate.log
+```
+
+### Force restart
+```bash
+launchctl unload ~/Library/LaunchAgents/com.gerardob.whisperdictate.plist
+pkill -9 -f dictate.py
+launchctl load ~/Library/LaunchAgents/com.gerardob.whisperdictate.plist
+```
 
 ## License
 

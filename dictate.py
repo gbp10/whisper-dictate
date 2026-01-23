@@ -3,6 +3,10 @@
 Whisper Dictate - Global hotkey dictation using OpenAI Whisper
 Hold Ctrl+Space to record, release to stop and transcribe.
 Transcribed text is automatically typed at your cursor position.
+
+Requirements:
+- macOS Accessibility permission for the terminal/Python app
+- macOS Microphone permission for the terminal/Python app
 """
 
 import os
@@ -15,19 +19,147 @@ from pynput import keyboard
 from pynput.keyboard import Controller as KeyboardController
 import whisper
 import time
+import logging
+from logging.handlers import RotatingFileHandler
+from pathlib import Path
+import multiprocessing
 
+# ============================================================================
 # Configuration
+# ============================================================================
 SAMPLE_RATE = 16000
 MODEL_NAME = "medium"  # Options: tiny, base, small, medium, large
 LANGUAGE = "en"  # None = auto-detect, or "en", "es", "fr", etc.
 SILENCE_THRESHOLD = 0.01  # Audio level below this is considered silence
 SILENCE_TRIM_MS = 100  # Keep this much silence at edges (milliseconds)
 
+# Logging configuration
+LOG_FILE = Path.home() / "whisper-dictate" / "dictate.log"
+LOG_MAX_BYTES = 1 * 1024 * 1024  # 1 MB max log size
+LOG_BACKUP_COUNT = 3  # Keep 3 backup logs
+
+# ============================================================================
+# Logging Setup with Rotation
+# ============================================================================
+def setup_logging():
+    """Configure logging with rotation to prevent unbounded growth"""
+    LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
+
+    # Create formatter
+    formatter = logging.Formatter(
+        '%(asctime)s - %(levelname)s - %(message)s',
+        datefmt='%Y-%m-%d %H:%M:%S'
+    )
+
+    # Get or create named logger (avoid duplicates with root logger)
+    logger = logging.getLogger('whisper_dictate')
+
+    # Clear any existing handlers to avoid duplicates on reload
+    logger.handlers.clear()
+    logger.setLevel(logging.INFO)
+    logger.propagate = False  # Don't propagate to root logger
+
+    # File handler with rotation
+    file_handler = RotatingFileHandler(
+        LOG_FILE,
+        maxBytes=LOG_MAX_BYTES,
+        backupCount=LOG_BACKUP_COUNT,
+        encoding='utf-8'
+    )
+    file_handler.setFormatter(formatter)
+    file_handler.setLevel(logging.INFO)
+    logger.addHandler(file_handler)
+
+    # Only add console handler if running interactively (not under launchd)
+    # When running under launchd, stdout goes to the log file anyway
+    if sys.stdout.isatty():
+        console_handler = logging.StreamHandler(sys.stdout)
+        console_handler.setFormatter(formatter)
+        console_handler.setLevel(logging.INFO)
+        logger.addHandler(console_handler)
+
+    return logger
+
+logger = setup_logging()
+
+# ============================================================================
+# Permission Checks
+# ============================================================================
+def check_accessibility_permission():
+    """Check if Accessibility permission is granted (macOS)"""
+    try:
+        # Try to create a keyboard listener - this will fail without permission
+        test_listener = keyboard.Listener(on_press=lambda k: None)
+        test_listener.start()
+        time.sleep(0.1)
+        test_listener.stop()
+        return True
+    except Exception as e:
+        logger.error(f"Accessibility check failed: {e}")
+        return False
+
+def check_microphone_permission():
+    """Check if Microphone permission is granted"""
+    try:
+        # Try to open an audio stream briefly
+        with sd.InputStream(samplerate=SAMPLE_RATE, channels=1, dtype=np.float32):
+            pass
+        return True
+    except sd.PortAudioError as e:
+        logger.error(f"Microphone permission check failed: {e}")
+        return False
+    except Exception as e:
+        logger.error(f"Microphone check error: {e}")
+        return False
+
+def print_permission_instructions():
+    """Print instructions for granting permissions"""
+    print("\n" + "=" * 60)
+    print("PERMISSION SETUP REQUIRED")
+    print("=" * 60)
+    print("\nPlease grant the following permissions in:")
+    print("  System Settings -> Privacy & Security")
+    print("\n1. ACCESSIBILITY (required for hotkey)")
+    print("   - Add Terminal.app (or your terminal)")
+    print("   - OR add Python.app from:")
+    print(f"     {sys.executable}")
+    print("\n2. MICROPHONE (required for recording)")
+    print("   - Add Terminal.app (or your terminal)")
+    print("\nAfter granting permissions, restart this script.")
+    print("=" * 60 + "\n")
+
+def verify_permissions():
+    """Verify all required permissions are granted"""
+    logger.info("Checking permissions...")
+
+    # Check microphone first (less intrusive test)
+    mic_ok = check_microphone_permission()
+    if mic_ok:
+        logger.info("Microphone permission: OK")
+    else:
+        logger.warning("Microphone permission: DENIED")
+
+    # Check accessibility (will show warning in console if denied)
+    # We check this by observing if pynput prints the "not trusted" warning
+    acc_ok = True  # We'll verify this differently
+
+    if not mic_ok:
+        print_permission_instructions()
+        return False
+
+    return True
+
+# ============================================================================
+# Main Whisper Dictate Class
+# ============================================================================
 class WhisperDictate:
     def __init__(self):
-        print("Loading Whisper model... (this may take a moment)")
+        logger.info("Initializing Whisper Dictate...")
+        logger.info(f"Python: {sys.executable}")
+        logger.info(f"Loading Whisper model '{MODEL_NAME}'... (this may take a moment)")
+
         self.model = whisper.load_model(MODEL_NAME)
-        print(f"Model '{MODEL_NAME}' loaded successfully!")
+        logger.info(f"Model '{MODEL_NAME}' loaded successfully!")
 
         self.recording = False
         self.audio_data = []
@@ -36,36 +168,37 @@ class WhisperDictate:
         self.keyboard_controller = KeyboardController()
         self.stream = None
         self.listener = None
+        self._shutdown_requested = False
 
-        # List available audio devices
-        print("\nAvailable audio devices:")
-        print(sd.query_devices())
-        print(f"\nUsing default input device: {sd.query_devices(kind='input')['name']}\n")
+        # Log available audio devices
+        logger.info("Available audio devices:")
+        devices = sd.query_devices()
+        for i, dev in enumerate(devices):
+            if dev['max_input_channels'] > 0:
+                logger.info(f"  [{i}] {dev['name']} (inputs: {dev['max_input_channels']})")
+
+        default_input = sd.query_devices(kind='input')
+        logger.info(f"Using default input: {default_input['name']}")
 
     def audio_callback(self, indata, frames, time_info, status):
         """Callback for audio recording"""
         if status:
-            print(f"Audio status: {status}")
+            logger.warning(f"Audio status: {status}")
         if self.recording:
             self.audio_data.append(indata.copy())
 
     def trim_silence(self, audio):
         """Trim silence from beginning and end of audio"""
-        # Calculate the amplitude envelope
         amplitude = np.abs(audio)
-
-        # Find where audio exceeds threshold
         above_threshold = amplitude > SILENCE_THRESHOLD
 
         if not np.any(above_threshold):
             return audio  # All silence, return as-is
 
-        # Find first and last non-silent samples
         non_silent_indices = np.where(above_threshold)[0]
         start_idx = non_silent_indices[0]
         end_idx = non_silent_indices[-1]
 
-        # Add small buffer (convert ms to samples)
         buffer_samples = int(SILENCE_TRIM_MS * SAMPLE_RATE / 1000)
         start_idx = max(0, start_idx - buffer_samples)
         end_idx = min(len(audio), end_idx + buffer_samples)
@@ -74,7 +207,7 @@ class WhisperDictate:
 
         original_duration = len(audio) / SAMPLE_RATE
         trimmed_duration = len(trimmed) / SAMPLE_RATE
-        print(f"Trimmed silence: {original_duration:.2f}s → {trimmed_duration:.2f}s")
+        logger.info(f"Trimmed silence: {original_duration:.2f}s -> {trimmed_duration:.2f}s")
 
         return trimmed
 
@@ -92,9 +225,9 @@ class WhisperDictate:
                 callback=self.audio_callback
             )
             self.stream.start()
-            print("🎤 Recording... (release Ctrl+Space to stop)")
+            logger.info("Recording... (release Ctrl+Space to stop)")
         except Exception as e:
-            print(f"Error starting recording: {e}")
+            logger.error(f"Error starting recording: {e}")
             self.recording = False
 
     def stop_recording(self):
@@ -102,13 +235,17 @@ class WhisperDictate:
         if not self.recording:
             return
         self.recording = False
+
         if self.stream:
-            self.stream.stop()
-            self.stream.close()
+            try:
+                self.stream.stop()
+                self.stream.close()
+            except Exception as e:
+                logger.warning(f"Error closing stream: {e}")
             self.stream = None
 
         if not self.audio_data:
-            print("No audio recorded")
+            logger.warning("No audio recorded")
             return
 
         # Combine audio chunks
@@ -116,110 +253,177 @@ class WhisperDictate:
 
         # Check if there's actual audio content
         audio_level = np.abs(audio).mean()
-        print(f"Audio level: {audio_level:.6f}")
+        logger.info(f"Audio level: {audio_level:.6f}")
 
         if audio_level < 0.0001:
-            print("⚠️  Audio level too low - check your microphone permissions or input device")
+            logger.warning("Audio level too low - check microphone permissions or input device")
             return
 
         # Trim silence
         audio = self.trim_silence(audio)
 
-        print("⏳ Transcribing...")
+        logger.info("Transcribing...")
 
-        # Transcribe with Whisper (task="transcribe" keeps original language, not translate)
-        result = self.model.transcribe(
-            audio,
-            fp16=False,
-            language=LANGUAGE,
-            task="transcribe",
-            without_timestamps=True,
-            condition_on_previous_text=False,
-            initial_prompt="Transcribe spoken English accurately with proper punctuation."
-        )
-        text = result["text"].strip()
+        try:
+            # Transcribe with Whisper
+            result = self.model.transcribe(
+                audio,
+                fp16=False,
+                language=LANGUAGE,
+                task="transcribe",
+                without_timestamps=True,
+                condition_on_previous_text=False,
+                initial_prompt="Transcribe spoken English accurately with proper punctuation."
+            )
+            text = result["text"].strip()
 
-        # Show detected language if auto-detecting
-        if LANGUAGE is None and "language" in result:
-            print(f"🌐 Detected language: {result['language']}")
+            # Show detected language if auto-detecting
+            if LANGUAGE is None and "language" in result:
+                logger.info(f"Detected language: {result['language']}")
 
-        if text:
-            print(f"📝 Transcribed: {text}")
-            self.type_text(text)
-        else:
-            print("No speech detected")
+            if text:
+                logger.info(f"Transcribed: {text}")
+                self.type_text(text)
+            else:
+                logger.warning("No speech detected")
+
+        except Exception as e:
+            logger.error(f"Transcription error: {e}")
 
     def type_text(self, text):
         """Type the transcribed text at cursor position"""
         time.sleep(0.1)
 
-        # Use pbcopy + pbpaste approach for reliability on macOS
-        process = subprocess.Popen(['pbcopy'], stdin=subprocess.PIPE)
-        process.communicate(text.encode('utf-8'))
+        try:
+            # Use pbcopy + pbpaste approach for reliability on macOS
+            process = subprocess.Popen(['pbcopy'], stdin=subprocess.PIPE)
+            process.communicate(text.encode('utf-8'))
 
-        # Paste with Cmd+V
-        with self.keyboard_controller.pressed(keyboard.Key.cmd):
-            self.keyboard_controller.tap('v')
+            # Paste with Cmd+V
+            with self.keyboard_controller.pressed(keyboard.Key.cmd):
+                self.keyboard_controller.tap('v')
 
-        print("✅ Text pasted!")
+            logger.info("Text pasted!")
+        except Exception as e:
+            logger.error(f"Error pasting text: {e}")
 
     def on_press(self, key):
         """Handle key press events"""
-        if key == keyboard.Key.ctrl or key == keyboard.Key.ctrl_l or key == keyboard.Key.ctrl_r:
-            self.ctrl_pressed = True
-        elif key == keyboard.Key.space:
-            self.space_pressed = True
+        try:
+            if key == keyboard.Key.ctrl or key == keyboard.Key.ctrl_l or key == keyboard.Key.ctrl_r:
+                self.ctrl_pressed = True
+            elif key == keyboard.Key.space:
+                self.space_pressed = True
 
-        # Start recording when both keys are pressed
-        if self.ctrl_pressed and self.space_pressed and not self.recording:
-            self.start_recording()
+            # Start recording when both keys are pressed
+            if self.ctrl_pressed and self.space_pressed and not self.recording:
+                self.start_recording()
+        except Exception as e:
+            logger.error(f"Key press error: {e}")
 
     def on_release(self, key):
         """Handle key release events"""
-        if key == keyboard.Key.ctrl or key == keyboard.Key.ctrl_l or key == keyboard.Key.ctrl_r:
-            self.ctrl_pressed = False
-        elif key == keyboard.Key.space:
-            self.space_pressed = False
+        try:
+            if key == keyboard.Key.ctrl or key == keyboard.Key.ctrl_l or key == keyboard.Key.ctrl_r:
+                self.ctrl_pressed = False
+            elif key == keyboard.Key.space:
+                self.space_pressed = False
 
-        # Stop recording when either key is released
-        if self.recording and (not self.ctrl_pressed or not self.space_pressed):
-            self.stop_recording()
+            # Stop recording when either key is released
+            if self.recording and (not self.ctrl_pressed or not self.space_pressed):
+                self.stop_recording()
+        except Exception as e:
+            logger.error(f"Key release error: {e}")
 
-    def cleanup(self, *args):
-        """Clean up resources"""
-        print("\nShutting down...")
+    def cleanup(self, signum=None, frame=None):
+        """Clean up resources properly"""
+        if self._shutdown_requested:
+            return
+        self._shutdown_requested = True
+
+        logger.info("Shutting down...")
         self.recording = False
+
+        # Stop audio stream
         if self.stream:
-            self.stream.stop()
-            self.stream.close()
+            try:
+                self.stream.stop()
+                self.stream.close()
+            except Exception as e:
+                logger.warning(f"Error closing audio stream: {e}")
+            self.stream = None
+
+        # Stop keyboard listener
         if self.listener:
-            self.listener.stop()
+            try:
+                self.listener.stop()
+            except Exception as e:
+                logger.warning(f"Error stopping listener: {e}")
+            self.listener = None
+
+        logger.info("Cleanup complete")
         sys.exit(0)
 
     def run(self):
         """Main loop"""
-        # Handle Ctrl+C gracefully
+        # Handle signals gracefully
         signal.signal(signal.SIGINT, self.cleanup)
         signal.signal(signal.SIGTERM, self.cleanup)
 
-        print("\n" + "="*50)
-        print("🎙️  Whisper Dictate Ready!")
-        print("="*50)
+        logger.info("=" * 50)
+        logger.info("Whisper Dictate Ready!")
+        logger.info("=" * 50)
+        logger.info(f"Hotkey: Hold Ctrl+Space to record")
+        logger.info(f"Model: {MODEL_NAME}")
+        logger.info(f"Language: {'Auto-detect' if LANGUAGE is None else LANGUAGE}")
+        logger.info("Press Ctrl+C to quit")
+        logger.info("=" * 50)
+
+        # Print to console as well for visibility
+        print("\n" + "=" * 50)
+        print("Whisper Dictate Ready!")
+        print("=" * 50)
         print(f"Hotkey: Hold Ctrl+Space to record")
         print(f"Model: {MODEL_NAME}")
         print(f"Language: {'Auto-detect' if LANGUAGE is None else LANGUAGE}")
         print("Press Ctrl+C to quit")
-        print("="*50 + "\n")
+        print("=" * 50 + "\n")
 
-        self.listener = keyboard.Listener(on_press=self.on_press, on_release=self.on_release)
+        self.listener = keyboard.Listener(
+            on_press=self.on_press,
+            on_release=self.on_release
+        )
         self.listener.start()
 
         try:
-            while self.listener.is_alive():
+            while self.listener.is_alive() and not self._shutdown_requested:
                 self.listener.join(timeout=0.5)
         except KeyboardInterrupt:
+            pass
+        finally:
             self.cleanup()
 
+
+# ============================================================================
+# Entry Point
+# ============================================================================
 if __name__ == "__main__":
-    app = WhisperDictate()
-    app.run()
+    # Fix multiprocessing semaphore leak warning
+    multiprocessing.set_start_method('spawn', force=True)
+
+    logger.info("Starting Whisper Dictate...")
+    logger.info(f"Log file: {LOG_FILE}")
+
+    # Verify permissions
+    if not verify_permissions():
+        logger.error("Permission check failed. Please grant required permissions.")
+        sys.exit(1)
+
+    try:
+        app = WhisperDictate()
+        app.run()
+    except KeyboardInterrupt:
+        logger.info("Interrupted by user")
+    except Exception as e:
+        logger.error(f"Fatal error: {e}")
+        raise

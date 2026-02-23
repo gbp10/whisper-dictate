@@ -11,6 +11,8 @@ A simple, free, and local voice dictation tool for macOS using OpenAI's Whisper 
 - Auto-pastes transcribed text at cursor position
 - Runs in background via launchd, starts on boot
 - Automatic silence trimming
+- Watchdog timer prevents mic from getting stuck (auto-stops after 5 min)
+- Robust audio stream cleanup on all exit paths
 - Log rotation (max 1MB, keeps 3 backups)
 
 ## Requirements
@@ -87,6 +89,7 @@ Edit `~/whisper-dictate/dictate.py` to change settings:
 | `MODEL_NAME` | `medium` | `tiny`, `base`, `small`, `medium`, `large` |
 | `LANGUAGE` | `en` | `en`, `es`, `fr`, `de`, `it`, `None` (auto-detect) |
 | `SILENCE_THRESHOLD` | `0.01` | Lower = more sensitive |
+| `MAX_RECORDING_SECONDS` | `300` | Auto-stop safety timeout (seconds) |
 | `LOG_MAX_BYTES` | `1MB` | Max log file size before rotation |
 
 After editing, restart the service:
@@ -131,9 +134,15 @@ After editing, restart the service:
 - Check **Microphone** permission in System Settings
 - Verify correct input device is selected in Sound settings
 
+### Microphone stuck / locked
+- This is caused by macOS missing the key-release event, leaving the audio stream open
+- The watchdog timer will auto-stop recording after 5 minutes as a safety net
+- To manually recover: `pkill -9 -f dictate.py` then restart
+
 ### Hotkey not working
 - Ensure Accessibility permission is granted
 - Check if another app is using Ctrl+Space
+- If launched from terminal, use `open WhisperDictate.app` instead of running `dictate.py` directly
 
 ### Multiple instances running
 ```bash

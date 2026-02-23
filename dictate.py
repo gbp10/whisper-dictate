@@ -23,6 +23,7 @@ import logging
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 import multiprocessing
+import threading
 
 # ============================================================================
 # Configuration
@@ -32,6 +33,8 @@ MODEL_NAME = "medium"  # Options: tiny, base, small, medium, large
 LANGUAGE = "en"  # None = auto-detect, or "en", "es", "fr", etc.
 SILENCE_THRESHOLD = 0.01  # Audio level below this is considered silence
 SILENCE_TRIM_MS = 100  # Keep this much silence at edges (milliseconds)
+MAX_RECORDING_SECONDS = 300  # Auto-stop recording after 5 minutes (safety net)
+WATCHDOG_INTERVAL_SECONDS = 2  # How often the watchdog checks for stuck state
 
 # Logging configuration
 LOG_FILE = Path.home() / "whisper-dictate" / "dictate.log"
@@ -169,6 +172,8 @@ class WhisperDictate:
         self.stream = None
         self.listener = None
         self._shutdown_requested = False
+        self._recording_start_time = None
+        self._watchdog_timer = None
 
         # Log available audio devices
         logger.info("Available audio devices:")
@@ -238,12 +243,65 @@ class WhisperDictate:
             logger.error(f"Error querying devices: {e}")
         return devices
 
+    def _start_watchdog(self):
+        """Start a watchdog timer that auto-stops recording after MAX_RECORDING_SECONDS"""
+        self._cancel_watchdog()
+
+        def _watchdog_check():
+            if not self.recording or self._recording_start_time is None:
+                return
+            elapsed = time.time() - self._recording_start_time
+            if elapsed >= MAX_RECORDING_SECONDS:
+                logger.warning(
+                    f"Watchdog: recording stuck for {elapsed:.0f}s "
+                    f"(max {MAX_RECORDING_SECONDS}s). Force-stopping."
+                )
+                # Reset key state to prevent re-trigger
+                self.ctrl_pressed = False
+                self.space_pressed = False
+                self.stop_recording()
+            else:
+                # Re-schedule watchdog
+                self._watchdog_timer = threading.Timer(
+                    WATCHDOG_INTERVAL_SECONDS, _watchdog_check
+                )
+                self._watchdog_timer.daemon = True
+                self._watchdog_timer.start()
+
+        self._watchdog_timer = threading.Timer(
+            WATCHDOG_INTERVAL_SECONDS, _watchdog_check
+        )
+        self._watchdog_timer.daemon = True
+        self._watchdog_timer.start()
+
+    def _cancel_watchdog(self):
+        """Cancel the watchdog timer"""
+        if self._watchdog_timer is not None:
+            self._watchdog_timer.cancel()
+            self._watchdog_timer = None
+
+    def _force_release_stream(self):
+        """Force-close the audio stream and release the mic, handling all error cases"""
+        stream = self.stream
+        self.stream = None
+        if stream is not None:
+            try:
+                if stream.active:
+                    stream.stop()
+            except Exception as e:
+                logger.warning(f"Error stopping stream: {e}")
+            try:
+                stream.close()
+            except Exception as e:
+                logger.warning(f"Error closing stream: {e}")
+
     def start_recording(self):
         """Start recording audio with automatic device fallback"""
         if self.recording:
             return
         self.audio_data = []
         self.recording = True
+        self._recording_start_time = time.time()
 
         # Try default device first, then fallback to others
         devices_to_try = [(None, "default")]  # None = use system default
@@ -267,6 +325,8 @@ class WhisperDictate:
                     logger.info(f"Recording with fallback device: {device_name}")
                 else:
                     logger.info("Recording... (release Ctrl+Space to stop)")
+                # Start watchdog to auto-stop if release event is missed
+                self._start_watchdog()
                 return  # Success
             except Exception as e:
                 last_error = e
@@ -279,20 +339,18 @@ class WhisperDictate:
         # All devices failed
         logger.error(f"All audio devices failed. Last error: {last_error}")
         self.recording = False
+        self._recording_start_time = None
 
     def stop_recording(self):
         """Stop recording and transcribe"""
         if not self.recording:
             return
         self.recording = False
+        self._recording_start_time = None
+        self._cancel_watchdog()
 
-        if self.stream:
-            try:
-                self.stream.stop()
-                self.stream.close()
-            except Exception as e:
-                logger.warning(f"Error closing stream: {e}")
-            self.stream = None
+        # Always force-release the mic stream
+        self._force_release_stream()
 
         if not self.audio_data:
             logger.warning("No audio recorded")
@@ -382,8 +440,19 @@ class WhisperDictate:
             # Stop recording when either key is released
             if self.recording and (not self.ctrl_pressed or not self.space_pressed):
                 self.stop_recording()
+
+            # Safety: if we're not recording, ensure key state is clean
+            # This prevents ghost key states from missed events
+            if not self.recording and not self.ctrl_pressed and not self.space_pressed:
+                pass  # Normal idle state
         except Exception as e:
             logger.error(f"Key release error: {e}")
+            # On any error in release handler, force-stop recording to release mic
+            if self.recording:
+                logger.warning("Force-stopping recording due to release handler error")
+                self.ctrl_pressed = False
+                self.space_pressed = False
+                self.stop_recording()
 
     def cleanup(self, signum=None, frame=None):
         """Clean up resources properly"""
@@ -393,15 +462,11 @@ class WhisperDictate:
 
         logger.info("Shutting down...")
         self.recording = False
+        self._recording_start_time = None
+        self._cancel_watchdog()
 
         # Stop audio stream
-        if self.stream:
-            try:
-                self.stream.stop()
-                self.stream.close()
-            except Exception as e:
-                logger.warning(f"Error closing audio stream: {e}")
-            self.stream = None
+        self._force_release_stream()
 
         # Stop keyboard listener
         if self.listener:

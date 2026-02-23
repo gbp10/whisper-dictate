@@ -5,15 +5,15 @@
     <key>CFBundleExecutable</key>
     <string>WhisperDictate</string>
     <key>CFBundleIdentifier</key>
-    <string>com.gerardob.whisperdictate</string>
+    <string>com.whisperdictate.app</string>
     <key>CFBundleName</key>
     <string>WhisperDictate</string>
     <key>CFBundleDisplayName</key>
     <string>Whisper Dictate</string>
     <key>CFBundleVersion</key>
-    <string>1.0</string>
+    <string>1.1</string>
     <key>CFBundleShortVersionString</key>
-    <string>1.0</string>
+    <string>1.1</string>
     <key>CFBundlePackageType</key>
     <string>APPL</string>
     <key>LSMinimumSystemVersion</key>

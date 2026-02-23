@@ -9,7 +9,7 @@ A simple, free, and local voice dictation tool for macOS using OpenAI's Whisper 
 - Hold-to-record hotkey (Ctrl+Space)
 - 100% local - your voice never leaves your machine
 - Auto-pastes transcribed text at cursor position
-- Runs in background via launchd, starts on boot
+- Automatic audio device fallback
 - Automatic silence trimming
 - Watchdog timer prevents mic from getting stuck (auto-stops after 5 min)
 - Robust audio stream cleanup on all exit paths
@@ -22,43 +22,41 @@ A simple, free, and local voice dictation tool for macOS using OpenAI's Whisper 
 - ~1GB disk space for the Whisper model
 - ffmpeg (installed automatically)
 
-## Quick Start
+## Installation
 
 ```bash
-# Start manually
-~/bin/run_whisper_dictate.sh start
+# 1. Clone the repo
+git clone https://github.com/gbp10/whisper-dictate.git ~/whisper-dictate
 
-# Check status
-~/bin/run_whisper_dictate.sh status
-
-# View logs
-~/bin/run_whisper_dictate.sh logs
-
-# Stop
-~/bin/run_whisper_dictate.sh stop
-
-# Restart
-~/bin/run_whisper_dictate.sh restart
+# 2. Run the installer
+cd ~/whisper-dictate && bash install.sh
 ```
 
-## Permissions Required (IMPORTANT)
+The installer will:
+- Install Homebrew and ffmpeg (if needed)
+- Create a Python virtual environment at `~/whisper-official/`
+- Install all dependencies (openai-whisper, sounddevice, pynput, numpy)
+- Download the Whisper medium model (~769 MB)
+- Build the `WhisperDictate.app` with your system's paths
+- Create a launcher script at `~/bin/run_whisper_dictate.sh`
 
-After installation, you MUST grant these permissions in **System Settings -> Privacy & Security**:
+## Permissions (IMPORTANT)
 
-### 1. Accessibility (Required for Hotkey)
+After installation, you **must** grant these permissions in **System Settings > Privacy & Security**:
 
-The Python app needs Accessibility permission to monitor keyboard events (Ctrl+Space).
+### 1. Accessibility (required for Ctrl+Space hotkey)
 
-1. Open **System Settings -> Privacy & Security -> Accessibility**
+1. Open **System Settings > Privacy & Security > Accessibility**
 2. Click the **+** button
-3. Navigate to: `/opt/homebrew/Cellar/python@3.14/3.14.0_1/Frameworks/Python.framework/Versions/3.14/Resources/Python.app`
-   - Or simply add **Terminal.app** (easier)
-4. Enable the checkbox
+3. Navigate to `~/whisper-dictate/` and add **WhisperDictate.app**
+4. Make sure the toggle is **ON**
 
-### 2. Microphone (Required for Recording)
+### 2. Microphone (required for recording)
 
-1. Open **System Settings -> Privacy & Security -> Microphone**
-2. Enable for **Terminal.app** (or your terminal)
+1. Open **System Settings > Privacy & Security > Microphone**
+2. Enable for **WhisperDictate** (it will appear after the first recording attempt)
+
+> **Note:** You must launch via `WhisperDictate.app` (not `python dictate.py` directly) for permissions to work. The installer configures this automatically.
 
 ## Usage
 
@@ -67,18 +65,26 @@ The Python app needs Accessibility permission to monitor keyboard events (Ctrl+S
 3. Release **Ctrl+Space** to transcribe
 4. Text is automatically pasted at your cursor
 
-## Service Management
-
-The service runs as a launchd agent that starts automatically on login.
+## Managing the Service
 
 ```bash
-# Manual control
-~/bin/run_whisper_dictate.sh start|stop|restart|status|logs
+# Start
+~/bin/run_whisper_dictate.sh start
 
-# Or use launchctl directly
-launchctl load ~/Library/LaunchAgents/com.gerardob.whisperdictate.plist
-launchctl unload ~/Library/LaunchAgents/com.gerardob.whisperdictate.plist
+# Stop
+~/bin/run_whisper_dictate.sh stop
+
+# Restart
+~/bin/run_whisper_dictate.sh restart
+
+# Check status
+~/bin/run_whisper_dictate.sh status
+
+# View logs
+~/bin/run_whisper_dictate.sh logs
 ```
+
+To auto-start on login, add `WhisperDictate.app` in **System Settings > General > Login Items**.
 
 ## Configuration
 
@@ -112,23 +118,22 @@ After editing, restart the service:
 
 ```
 ~/whisper-dictate/
-├── dictate.py              # Main script
-├── dictate.log             # Current log (rotates at 1MB)
-├── dictate.log.1           # Backup log 1
-├── dictate.log.2           # Backup log 2
-├── dictate.log.3           # Backup log 3
-├── .dictate.pid            # PID file for launcher
-└── README.md               # This file
+├── dictate.py                  # Main script
+├── install.sh                  # Installer
+├── requirements.txt            # Python dependencies
+├── WhisperDictate.app/         # macOS app bundle (built by installer)
+├── dictate.log                 # Current log (rotates at 1MB)
+└── README.md                   # This file
 
-~/whisper-official/          # Python virtual environment
-~/bin/run_whisper_dictate.sh # Launcher script
-~/Library/LaunchAgents/com.gerardob.whisperdictate.plist  # launchd config
+~/whisper-official/             # Python virtual environment
+~/bin/run_whisper_dictate.sh    # Launcher script
 ```
 
 ## Troubleshooting
 
 ### "This process is not trusted"
-- Add Python.app or Terminal.app to **Accessibility** in System Settings
+- Add **WhisperDictate.app** (not Terminal or Python) to **Accessibility** in System Settings
+- Re-run the installer if needed: `cd ~/whisper-dictate && bash install.sh`
 
 ### "Audio level too low"
 - Check **Microphone** permission in System Settings
@@ -140,9 +145,9 @@ After editing, restart the service:
 - To manually recover: `pkill -9 -f dictate.py` then restart
 
 ### Hotkey not working
-- Ensure Accessibility permission is granted
+- Ensure Accessibility permission is granted to **WhisperDictate.app**
 - Check if another app is using Ctrl+Space
-- If launched from terminal, use `open WhisperDictate.app` instead of running `dictate.py` directly
+- Make sure you launched via `open WhisperDictate.app` or the launcher script
 
 ### Multiple instances running
 ```bash
@@ -153,13 +158,6 @@ pkill -9 -f dictate.py
 ### View detailed logs
 ```bash
 tail -f ~/whisper-dictate/dictate.log
-```
-
-### Force restart
-```bash
-launchctl unload ~/Library/LaunchAgents/com.gerardob.whisperdictate.plist
-pkill -9 -f dictate.py
-launchctl load ~/Library/LaunchAgents/com.gerardob.whisperdictate.plist
 ```
 
 ## License

@@ -3,291 +3,192 @@
 # Whisper Dictate Installer for macOS
 # Hold Ctrl+Space to record, release to transcribe and paste
 #
-# Usage: curl -fsSL https://raw.githubusercontent.com/YOUR_REPO/install.sh | bash
+# Usage:
+#   git clone https://github.com/gbp10/whisper-dictate.git ~/whisper-dictate
+#   cd ~/whisper-dictate && bash install.sh
 #
 
 set -e
 
+INSTALL_DIR="$HOME/whisper-dictate"
+VENV_DIR="$HOME/whisper-official"
+BIN_DIR="$HOME/bin"
+APP_DIR="$INSTALL_DIR/WhisperDictate.app"
+
 echo "=========================================="
-echo "🎙️  Whisper Dictate Installer"
+echo "  Whisper Dictate Installer"
 echo "=========================================="
 echo ""
 
 # Check macOS
 if [[ "$OSTYPE" != "darwin"* ]]; then
-    echo "❌ This script only works on macOS"
+    echo "ERROR: This script only works on macOS"
+    exit 1
+fi
+
+# Ensure we're running from the cloned repo
+if [ ! -f "$INSTALL_DIR/dictate.py" ]; then
+    echo "ERROR: dictate.py not found in $INSTALL_DIR"
+    echo ""
+    echo "Please clone the repo first:"
+    echo "  git clone https://github.com/gbp10/whisper-dictate.git ~/whisper-dictate"
+    echo "  cd ~/whisper-dictate && bash install.sh"
     exit 1
 fi
 
 # Check for Homebrew
 if ! command -v brew &> /dev/null; then
-    echo "📦 Installing Homebrew..."
+    echo "Installing Homebrew..."
     /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
 fi
 
 # Install ffmpeg (required by Whisper)
-echo "📦 Installing ffmpeg..."
+echo "Installing ffmpeg..."
 brew install ffmpeg 2>/dev/null || true
 
 # Create directories
-echo "📁 Creating directories..."
-mkdir -p ~/whisper-dictate
-mkdir -p ~/bin
-mkdir -p ~/Library/Logs
+echo "Creating directories..."
+mkdir -p "$BIN_DIR"
+mkdir -p "$HOME/Library/Logs"
 
 # Create virtual environment
-echo "🐍 Setting up Python environment..."
-python3 -m venv ~/whisper-official
-source ~/whisper-official/bin/activate
+echo "Setting up Python environment..."
+python3 -m venv "$VENV_DIR"
+source "$VENV_DIR/bin/activate"
 
 # Install dependencies
-echo "📦 Installing Whisper and dependencies..."
+echo "Installing Whisper and dependencies..."
 pip install --upgrade pip
 pip install openai-whisper sounddevice pynput numpy
 
-# Create the dictation script
-echo "📝 Creating dictation script..."
-cat > ~/whisper-dictate/dictate.py << 'DICTATE_SCRIPT'
-#!/usr/bin/env python3
-"""
-Whisper Dictate - Global hotkey dictation using OpenAI Whisper
-Hold Ctrl+Space to record, release to stop and transcribe.
-Transcribed text is automatically typed at your cursor position.
-"""
+# Build the WhisperDictate.app launcher with the current user's paths
+echo "Configuring WhisperDictate.app for your system..."
+mkdir -p "$APP_DIR/Contents/MacOS"
+mkdir -p "$APP_DIR/Contents/Resources"
 
-import os
-import sys
-import signal
-import subprocess
-import numpy as np
-import sounddevice as sd
-from pynput import keyboard
-from pynput.keyboard import Controller as KeyboardController
-import whisper
-import time
+cat > "$APP_DIR/Contents/MacOS/WhisperDictate" << LAUNCHER
+#!/bin/bash
+# WhisperDictate launcher - runs the Python script with the correct environment
 
-# Configuration
-SAMPLE_RATE = 16000
-MODEL_NAME = "medium"  # Options: tiny, base, small, medium, large
-LANGUAGE = "en"  # None = auto-detect, or "en", "es", "fr", etc.
-SILENCE_THRESHOLD = 0.01  # Audio level below this is considered silence
-SILENCE_TRIM_MS = 100  # Keep this much silence at edges (milliseconds)
+export PATH="/opt/homebrew/bin:/usr/local/bin:\$PATH"
 
-class WhisperDictate:
-    def __init__(self):
-        print("Loading Whisper model... (this may take a moment)")
-        self.model = whisper.load_model(MODEL_NAME)
-        print(f"Model '{MODEL_NAME}' loaded successfully!")
+cd "$INSTALL_DIR"
+exec "$VENV_DIR/bin/python3" "$INSTALL_DIR/dictate.py"
+LAUNCHER
+chmod +x "$APP_DIR/Contents/MacOS/WhisperDictate"
 
-        self.recording = False
-        self.audio_data = []
-        self.ctrl_pressed = False
-        self.space_pressed = False
-        self.keyboard_controller = KeyboardController()
-        self.stream = None
-        self.listener = None
+cat > "$APP_DIR/Contents/Info.plist" << 'PLIST'
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleExecutable</key>
+    <string>WhisperDictate</string>
+    <key>CFBundleIdentifier</key>
+    <string>com.whisperdictate.app</string>
+    <key>CFBundleName</key>
+    <string>WhisperDictate</string>
+    <key>CFBundleDisplayName</key>
+    <string>Whisper Dictate</string>
+    <key>CFBundleVersion</key>
+    <string>1.1</string>
+    <key>CFBundleShortVersionString</key>
+    <string>1.1</string>
+    <key>CFBundlePackageType</key>
+    <string>APPL</string>
+    <key>LSMinimumSystemVersion</key>
+    <string>10.15</string>
+    <key>LSUIElement</key>
+    <true/>
+    <key>NSMicrophoneUsageDescription</key>
+    <string>Whisper Dictate needs microphone access to transcribe your speech.</string>
+    <key>NSAppleEventsUsageDescription</key>
+    <string>Whisper Dictate needs accessibility access to detect hotkeys and paste text.</string>
+</dict>
+</plist>
+PLIST
 
-        print("\nAvailable audio devices:")
-        print(sd.query_devices())
-        print(f"\nUsing default input device: {sd.query_devices(kind='input')['name']}\n")
-
-    def audio_callback(self, indata, frames, time_info, status):
-        if status:
-            print(f"Audio status: {status}")
-        if self.recording:
-            self.audio_data.append(indata.copy())
-
-    def trim_silence(self, audio):
-        amplitude = np.abs(audio)
-        above_threshold = amplitude > SILENCE_THRESHOLD
-
-        if not np.any(above_threshold):
-            return audio
-
-        non_silent_indices = np.where(above_threshold)[0]
-        start_idx = non_silent_indices[0]
-        end_idx = non_silent_indices[-1]
-
-        buffer_samples = int(SILENCE_TRIM_MS * SAMPLE_RATE / 1000)
-        start_idx = max(0, start_idx - buffer_samples)
-        end_idx = min(len(audio), end_idx + buffer_samples)
-
-        trimmed = audio[start_idx:end_idx]
-        original_duration = len(audio) / SAMPLE_RATE
-        trimmed_duration = len(trimmed) / SAMPLE_RATE
-        print(f"Trimmed silence: {original_duration:.2f}s → {trimmed_duration:.2f}s")
-
-        return trimmed
-
-    def start_recording(self):
-        if self.recording:
-            return
-        self.audio_data = []
-        self.recording = True
-        try:
-            self.stream = sd.InputStream(
-                samplerate=SAMPLE_RATE,
-                channels=1,
-                dtype=np.float32,
-                callback=self.audio_callback
-            )
-            self.stream.start()
-            print("🎤 Recording... (release Ctrl+Space to stop)")
-        except Exception as e:
-            print(f"Error starting recording: {e}")
-            self.recording = False
-
-    def stop_recording(self):
-        if not self.recording:
-            return
-        self.recording = False
-        if self.stream:
-            self.stream.stop()
-            self.stream.close()
-            self.stream = None
-
-        if not self.audio_data:
-            print("No audio recorded")
-            return
-
-        audio = np.concatenate(self.audio_data, axis=0).flatten()
-        audio_level = np.abs(audio).mean()
-        print(f"Audio level: {audio_level:.6f}")
-
-        if audio_level < 0.0001:
-            print("⚠️  Audio level too low - check your microphone permissions or input device")
-            return
-
-        audio = self.trim_silence(audio)
-        print("⏳ Transcribing...")
-
-        result = self.model.transcribe(
-            audio,
-            fp16=False,
-            language=LANGUAGE,
-            task="transcribe",
-            without_timestamps=True,
-            condition_on_previous_text=False,
-            initial_prompt="Transcribe spoken English accurately with proper punctuation."
-        )
-        text = result["text"].strip()
-
-        if LANGUAGE is None and "language" in result:
-            print(f"🌐 Detected language: {result['language']}")
-
-        if text:
-            print(f"📝 Transcribed: {text}")
-            self.type_text(text)
-        else:
-            print("No speech detected")
-
-    def type_text(self, text):
-        time.sleep(0.1)
-        process = subprocess.Popen(['pbcopy'], stdin=subprocess.PIPE)
-        process.communicate(text.encode('utf-8'))
-        with self.keyboard_controller.pressed(keyboard.Key.cmd):
-            self.keyboard_controller.tap('v')
-        print("✅ Text pasted!")
-
-    def on_press(self, key):
-        if key == keyboard.Key.ctrl or key == keyboard.Key.ctrl_l or key == keyboard.Key.ctrl_r:
-            self.ctrl_pressed = True
-        elif key == keyboard.Key.space:
-            self.space_pressed = True
-
-        if self.ctrl_pressed and self.space_pressed and not self.recording:
-            self.start_recording()
-
-    def on_release(self, key):
-        if key == keyboard.Key.ctrl or key == keyboard.Key.ctrl_l or key == keyboard.Key.ctrl_r:
-            self.ctrl_pressed = False
-        elif key == keyboard.Key.space:
-            self.space_pressed = False
-
-        if self.recording and (not self.ctrl_pressed or not self.space_pressed):
-            self.stop_recording()
-
-    def cleanup(self, *args):
-        print("\nShutting down...")
-        self.recording = False
-        if self.stream:
-            self.stream.stop()
-            self.stream.close()
-        if self.listener:
-            self.listener.stop()
-        sys.exit(0)
-
-    def run(self):
-        signal.signal(signal.SIGINT, self.cleanup)
-        signal.signal(signal.SIGTERM, self.cleanup)
-
-        print("\n" + "="*50)
-        print("🎙️  Whisper Dictate Ready!")
-        print("="*50)
-        print(f"Hotkey: Hold Ctrl+Space to record")
-        print(f"Model: {MODEL_NAME}")
-        print(f"Language: {'Auto-detect' if LANGUAGE is None else LANGUAGE}")
-        print("Press Ctrl+C to quit")
-        print("="*50 + "\n")
-
-        self.listener = keyboard.Listener(on_press=self.on_press, on_release=self.on_release)
-        self.listener.start()
-
-        try:
-            while self.listener.is_alive():
-                self.listener.join(timeout=0.5)
-        except KeyboardInterrupt:
-            self.cleanup()
-
-if __name__ == "__main__":
-    app = WhisperDictate()
-    app.run()
-DICTATE_SCRIPT
-
-# Create launcher script
-echo "📝 Creating launcher script..."
-cat > ~/bin/run_whisper_dictate.sh << 'LAUNCHER_SCRIPT'
+# Create launcher shell script
+echo "Creating launcher script..."
+cat > "$BIN_DIR/run_whisper_dictate.sh" << LAUNCHER_SCRIPT
 #!/bin/zsh
-# Launch Whisper dictation service as a daemon (prevents duplicates)
+# Whisper Dictate launcher - start/stop/restart/status/logs
+
 export PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"
 
-# Check if already running
-if pgrep -f "whisper-dictate/dictate.py" > /dev/null; then
-    echo "Whisper dictate already running"
-    exit 0
-fi
+INSTALL_DIR="$INSTALL_DIR"
+APP_DIR="$APP_DIR"
 
-cd "$HOME/whisper-dictate"
-"$HOME/whisper-official/bin/python3" "$HOME/whisper-dictate/dictate.py" >> "$HOME/Library/Logs/whisper_dictate.log" 2>&1 &
-disown
+case "\${1:-start}" in
+    start)
+        if pgrep -f "whisper-dictate/dictate.py" > /dev/null; then
+            echo "Whisper Dictate is already running (PID: \$(pgrep -f 'whisper-dictate/dictate.py'))"
+            exit 0
+        fi
+        echo "Starting Whisper Dictate..."
+        open "\$APP_DIR"
+        echo "Started. Use Ctrl+Space to record."
+        ;;
+    stop)
+        if pgrep -f "whisper-dictate/dictate.py" > /dev/null; then
+            pkill -f "whisper-dictate/dictate.py"
+            echo "Whisper Dictate stopped."
+        else
+            echo "Whisper Dictate is not running."
+        fi
+        ;;
+    restart)
+        "\$0" stop
+        sleep 2
+        "\$0" start
+        ;;
+    status)
+        if pgrep -f "whisper-dictate/dictate.py" > /dev/null; then
+            echo "Whisper Dictate is running (PID: \$(pgrep -f 'whisper-dictate/dictate.py'))"
+        else
+            echo "Whisper Dictate is not running."
+        fi
+        ;;
+    logs)
+        tail -f "\$INSTALL_DIR/dictate.log"
+        ;;
+    *)
+        echo "Usage: \$0 {start|stop|restart|status|logs}"
+        exit 1
+        ;;
+esac
 LAUNCHER_SCRIPT
-
-chmod +x ~/bin/run_whisper_dictate.sh
+chmod +x "$BIN_DIR/run_whisper_dictate.sh"
 
 # Pre-download the model
-echo "📥 Downloading Whisper model (this may take a few minutes)..."
-~/whisper-official/bin/python3 -c "import whisper; whisper.load_model('medium')"
+echo "Downloading Whisper model (this may take a few minutes)..."
+"$VENV_DIR/bin/python3" -c "import whisper; whisper.load_model('medium')"
 
 echo ""
 echo "=========================================="
-echo "✅ Installation Complete!"
+echo "  Installation Complete!"
 echo "=========================================="
 echo ""
-echo "To start Whisper Dictate:"
-echo "  ~/bin/run_whisper_dictate.sh"
+echo "IMPORTANT - Grant these permissions in System Settings > Privacy & Security:"
+echo ""
+echo "  1. ACCESSIBILITY (for Ctrl+Space hotkey):"
+echo "     - Go to Privacy & Security > Accessibility"
+echo "     - Click + and add: $APP_DIR"
+echo "     - Make sure the toggle is ON"
+echo ""
+echo "  2. MICROPHONE (for voice recording):"
+echo "     - Go to Privacy & Security > Microphone"
+echo "     - Enable for WhisperDictate (will prompt on first use)"
+echo ""
+echo "To start:"
+echo "  open $APP_DIR"
+echo "  # or: ~/bin/run_whisper_dictate.sh start"
 echo ""
 echo "To auto-start on login:"
-echo "  1. Open System Settings → General → Login Items"
-echo "  2. Click '+' under 'Open at Login'"
-echo "  3. Press Cmd+Shift+G and enter: ~/bin"
-echo "  4. Select 'run_whisper_dictate.sh'"
+echo "  System Settings > General > Login Items > add WhisperDictate.app"
 echo ""
-echo "Usage: Hold Ctrl+Space to record, release to transcribe"
-echo ""
-echo "⚠️  IMPORTANT: Grant these permissions in System Settings → Privacy & Security:"
-echo "  - Accessibility: Enable for Terminal (or your terminal app)"
-echo "  - Microphone: Enable for Terminal (or your terminal app)"
+echo "Usage: Hold Ctrl+Space to record, release to transcribe and paste."
 echo ""
 echo "Starting Whisper Dictate now..."
-~/bin/run_whisper_dictate.sh
+open "$APP_DIR"
 echo "Done! Try holding Ctrl+Space and speaking."

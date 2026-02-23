@@ -24,11 +24,16 @@ A simple, free, and local voice dictation tool for macOS using OpenAI's Whisper 
 
 ## Installation
 
-```bash
-# 1. Clone the repo
-git clone https://github.com/gbp10/whisper-dictate.git ~/whisper-dictate
+**One-liner (recommended):**
 
-# 2. Run the installer
+```bash
+curl -fsSL https://raw.githubusercontent.com/gbp10/whisper-dictate/main/install.sh | bash
+```
+
+**Or manually:**
+
+```bash
+git clone https://github.com/gbp10/whisper-dictate.git ~/whisper-dictate
 cd ~/whisper-dictate && bash install.sh
 ```
 

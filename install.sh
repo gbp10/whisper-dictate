@@ -3,13 +3,17 @@
 # Whisper Dictate Installer for macOS
 # Hold Ctrl+Space to record, release to transcribe and paste
 #
-# Usage:
+# Usage (one-liner):
+#   curl -fsSL https://raw.githubusercontent.com/gbp10/whisper-dictate/main/install.sh | bash
+#
+# Or manually:
 #   git clone https://github.com/gbp10/whisper-dictate.git ~/whisper-dictate
 #   cd ~/whisper-dictate && bash install.sh
 #
 
 set -e
 
+REPO_URL="https://github.com/gbp10/whisper-dictate.git"
 INSTALL_DIR="$HOME/whisper-dictate"
 VENV_DIR="$HOME/whisper-official"
 BIN_DIR="$HOME/bin"
@@ -26,14 +30,21 @@ if [[ "$OSTYPE" != "darwin"* ]]; then
     exit 1
 fi
 
-# Ensure we're running from the cloned repo
+# Clone or update the repo if dictate.py is not present
 if [ ! -f "$INSTALL_DIR/dictate.py" ]; then
-    echo "ERROR: dictate.py not found in $INSTALL_DIR"
-    echo ""
-    echo "Please clone the repo first:"
-    echo "  git clone https://github.com/gbp10/whisper-dictate.git ~/whisper-dictate"
-    echo "  cd ~/whisper-dictate && bash install.sh"
-    exit 1
+    echo "Downloading Whisper Dictate..."
+    if [ -d "$INSTALL_DIR" ]; then
+        echo "Directory $INSTALL_DIR exists but is incomplete. Removing and re-cloning..."
+        rm -rf "$INSTALL_DIR"
+    fi
+    git clone "$REPO_URL" "$INSTALL_DIR"
+else
+    echo "Whisper Dictate repo found at $INSTALL_DIR"
+    # Pull latest changes if it's a git repo
+    if [ -d "$INSTALL_DIR/.git" ]; then
+        echo "Updating to latest version..."
+        git -C "$INSTALL_DIR" pull --ff-only 2>/dev/null || true
+    fi
 fi
 
 # Check for Homebrew

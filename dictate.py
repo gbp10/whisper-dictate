@@ -33,7 +33,7 @@ MODEL_NAME = "medium"  # Options: tiny, base, small, medium, large
 LANGUAGE = "en"  # None = auto-detect, or "en", "es", "fr", etc.
 SILENCE_THRESHOLD = 0.01  # Audio level below this is considered silence
 SILENCE_TRIM_MS = 100  # Keep this much silence at edges (milliseconds)
-MAX_RECORDING_SECONDS = 300  # Auto-stop recording after 5 minutes (safety net)
+MAX_RECORDING_SECONDS = 60  # Auto-stop recording after 60 seconds (safety net)
 WATCHDOG_INTERVAL_SECONDS = 2  # How often the watchdog checks for stuck state
 
 # Logging configuration

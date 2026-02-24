@@ -100,7 +100,7 @@ Edit `~/whisper-dictate/dictate.py` to change settings:
 | `MODEL_NAME` | `medium` | `tiny`, `base`, `small`, `medium`, `large` |
 | `LANGUAGE` | `en` | `en`, `es`, `fr`, `de`, `it`, `None` (auto-detect) |
 | `SILENCE_THRESHOLD` | `0.01` | Lower = more sensitive |
-| `MAX_RECORDING_SECONDS` | `300` | Auto-stop safety timeout (seconds) |
+| `MAX_RECORDING_SECONDS` | `60` | Auto-stop safety timeout (seconds) |
 | `LOG_MAX_BYTES` | `1MB` | Max log file size before rotation |
 
 After editing, restart the service:

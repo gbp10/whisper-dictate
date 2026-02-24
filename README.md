@@ -11,7 +11,7 @@ A simple, free, and local voice dictation tool for macOS using OpenAI's Whisper 
 - Auto-pastes transcribed text at cursor position
 - Automatic audio device fallback
 - Automatic silence trimming
-- Watchdog detects missed key-release events and auto-releases mic (15s fallback)
+- Watchdog monitors audio silence to auto-release mic if key-release is missed (15s)
 - Robust audio stream cleanup on all exit paths
 - Log rotation (max 1MB, keeps 3 backups)
 
@@ -100,7 +100,7 @@ Edit `~/whisper-dictate/dictate.py` to change settings:
 | `MODEL_NAME` | `medium` | `tiny`, `base`, `small`, `medium`, `large` |
 | `LANGUAGE` | `en` | `en`, `es`, `fr`, `de`, `it`, `None` (auto-detect) |
 | `SILENCE_THRESHOLD` | `0.01` | Lower = more sensitive |
-| `WATCHDOG_RELEASE_SECONDS` | `15` | Force-stop if keys released but mic still held (seconds) |
+| `WATCHDOG_SILENCE_SECONDS` | `15` | Force-stop after this many seconds of silence (catches missed key-release) |
 | `LOG_MAX_BYTES` | `1MB` | Max log file size before rotation |
 
 After editing, restart the service:
@@ -146,7 +146,7 @@ After editing, restart the service:
 
 ### Microphone stuck / locked
 - This is caused by macOS missing the key-release event, leaving the audio stream open
-- The watchdog detects when keys are released but recording is stuck, and auto-stops after 15 seconds
+- The watchdog monitors audio activity and auto-stops after 15 seconds of silence
 - To manually recover: `pkill -9 -f dictate.py` then restart
 
 ### Hotkey not working

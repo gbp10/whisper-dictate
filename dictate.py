@@ -33,8 +33,8 @@ MODEL_NAME = "medium"  # Options: tiny, base, small, medium, large
 LANGUAGE = "en"  # None = auto-detect, or "en", "es", "fr", etc.
 SILENCE_THRESHOLD = 0.01  # Audio level below this is considered silence
 SILENCE_TRIM_MS = 100  # Keep this much silence at edges (milliseconds)
-WATCHDOG_RELEASE_SECONDS = 15  # If keys appear released but recording persists, force-stop after this
-WATCHDOG_INTERVAL_SECONDS = 2  # How often the watchdog checks for stuck state
+WATCHDOG_INTERVAL_SECONDS = 5  # How often the watchdog checks for stuck state
+WATCHDOG_SILENCE_SECONDS = 15  # If no audio activity for this long, assume stuck and force-stop
 
 # Logging configuration
 LOG_FILE = Path.home() / "whisper-dictate" / "dictate.log"
@@ -174,7 +174,7 @@ class WhisperDictate:
         self._shutdown_requested = False
         self._recording_start_time = None
         self._watchdog_timer = None
-        self._keys_released_at = None  # Timestamp when keys were last seen released during recording
+        self._last_audio_activity = None  # Timestamp of last non-silent audio chunk
 
         # Log available audio devices
         logger.info("Available audio devices:")
@@ -192,6 +192,9 @@ class WhisperDictate:
             logger.warning(f"Audio status: {status}")
         if self.recording:
             self.audio_data.append(indata.copy())
+            # Track audio activity for the watchdog
+            if np.abs(indata).mean() > SILENCE_THRESHOLD:
+                self._last_audio_activity = time.time()
 
     def trim_silence(self, audio):
         """Trim silence from beginning and end of audio"""
@@ -245,42 +248,35 @@ class WhisperDictate:
         return devices
 
     def _start_watchdog(self):
-        """Start a watchdog that detects when keys are released but recording is stuck open.
+        """Start a watchdog that detects stuck recording via audio silence.
 
         Does NOT limit recording duration — you can dictate as long as you want.
-        Only triggers if pynput missed the key-release event, detected by checking
-        whether both keys appear unpressed while recording is still active.
+        Monitors actual audio activity: if no sound above the silence threshold
+        is detected for WATCHDOG_SILENCE_SECONDS, the user has stopped talking
+        and pynput likely missed the key-release. Force-stops to release the mic.
+
+        This approach is independent of pynput key state, which is unreliable
+        on macOS (the root cause of the stuck mic bug).
         """
         self._cancel_watchdog()
-        self._keys_released_at = None
+        self._last_audio_activity = time.time()
 
         def _watchdog_check():
             if not self.recording:
                 return
 
-            keys_held = self.ctrl_pressed and self.space_pressed
-
-            if keys_held:
-                # Keys are still held — user is actively recording, reset detection
-                self._keys_released_at = None
-            else:
-                # Keys appear released but recording is still active
-                if self._keys_released_at is None:
-                    # First time we notice — start the grace period
-                    self._keys_released_at = time.time()
-                else:
-                    stuck_for = time.time() - self._keys_released_at
-                    if stuck_for >= WATCHDOG_RELEASE_SECONDS:
-                        elapsed = time.time() - self._recording_start_time
-                        logger.warning(
-                            f"Watchdog: keys released but recording still active "
-                            f"after {stuck_for:.0f}s (total recording: {elapsed:.0f}s). "
-                            f"Force-stopping to release mic."
-                        )
-                        self.ctrl_pressed = False
-                        self.space_pressed = False
-                        self.stop_recording()
-                        return
+            silence_duration = time.time() - self._last_audio_activity
+            if silence_duration >= WATCHDOG_SILENCE_SECONDS:
+                elapsed = time.time() - self._recording_start_time
+                logger.warning(
+                    f"Watchdog: no audio activity for {silence_duration:.0f}s "
+                    f"(total recording: {elapsed:.0f}s). "
+                    f"Force-stopping to release mic."
+                )
+                self.ctrl_pressed = False
+                self.space_pressed = False
+                self.stop_recording()
+                return
 
             # Re-schedule watchdog
             self._watchdog_timer = threading.Timer(

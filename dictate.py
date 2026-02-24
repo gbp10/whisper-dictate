@@ -33,7 +33,7 @@ MODEL_NAME = "medium"  # Options: tiny, base, small, medium, large
 LANGUAGE = "en"  # None = auto-detect, or "en", "es", "fr", etc.
 SILENCE_THRESHOLD = 0.01  # Audio level below this is considered silence
 SILENCE_TRIM_MS = 100  # Keep this much silence at edges (milliseconds)
-MAX_RECORDING_SECONDS = 60  # Auto-stop recording after 60 seconds (safety net)
+WATCHDOG_RELEASE_SECONDS = 15  # If keys appear released but recording persists, force-stop after this
 WATCHDOG_INTERVAL_SECONDS = 2  # How often the watchdog checks for stuck state
 
 # Logging configuration
@@ -174,6 +174,7 @@ class WhisperDictate:
         self._shutdown_requested = False
         self._recording_start_time = None
         self._watchdog_timer = None
+        self._keys_released_at = None  # Timestamp when keys were last seen released during recording
 
         # Log available audio devices
         logger.info("Available audio devices:")
@@ -244,29 +245,49 @@ class WhisperDictate:
         return devices
 
     def _start_watchdog(self):
-        """Start a watchdog timer that auto-stops recording after MAX_RECORDING_SECONDS"""
+        """Start a watchdog that detects when keys are released but recording is stuck open.
+
+        Does NOT limit recording duration — you can dictate as long as you want.
+        Only triggers if pynput missed the key-release event, detected by checking
+        whether both keys appear unpressed while recording is still active.
+        """
         self._cancel_watchdog()
+        self._keys_released_at = None
 
         def _watchdog_check():
-            if not self.recording or self._recording_start_time is None:
+            if not self.recording:
                 return
-            elapsed = time.time() - self._recording_start_time
-            if elapsed >= MAX_RECORDING_SECONDS:
-                logger.warning(
-                    f"Watchdog: recording stuck for {elapsed:.0f}s "
-                    f"(max {MAX_RECORDING_SECONDS}s). Force-stopping."
-                )
-                # Reset key state to prevent re-trigger
-                self.ctrl_pressed = False
-                self.space_pressed = False
-                self.stop_recording()
+
+            keys_held = self.ctrl_pressed and self.space_pressed
+
+            if keys_held:
+                # Keys are still held — user is actively recording, reset detection
+                self._keys_released_at = None
             else:
-                # Re-schedule watchdog
-                self._watchdog_timer = threading.Timer(
-                    WATCHDOG_INTERVAL_SECONDS, _watchdog_check
-                )
-                self._watchdog_timer.daemon = True
-                self._watchdog_timer.start()
+                # Keys appear released but recording is still active
+                if self._keys_released_at is None:
+                    # First time we notice — start the grace period
+                    self._keys_released_at = time.time()
+                else:
+                    stuck_for = time.time() - self._keys_released_at
+                    if stuck_for >= WATCHDOG_RELEASE_SECONDS:
+                        elapsed = time.time() - self._recording_start_time
+                        logger.warning(
+                            f"Watchdog: keys released but recording still active "
+                            f"after {stuck_for:.0f}s (total recording: {elapsed:.0f}s). "
+                            f"Force-stopping to release mic."
+                        )
+                        self.ctrl_pressed = False
+                        self.space_pressed = False
+                        self.stop_recording()
+                        return
+
+            # Re-schedule watchdog
+            self._watchdog_timer = threading.Timer(
+                WATCHDOG_INTERVAL_SECONDS, _watchdog_check
+            )
+            self._watchdog_timer.daemon = True
+            self._watchdog_timer.start()
 
         self._watchdog_timer = threading.Timer(
             WATCHDOG_INTERVAL_SECONDS, _watchdog_check

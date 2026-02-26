@@ -34,7 +34,9 @@ LANGUAGE = "en"  # None = auto-detect, or "en", "es", "fr", etc.
 SILENCE_THRESHOLD = 0.01  # Audio level below this is considered silence
 SILENCE_TRIM_MS = 100  # Keep this much silence at edges (milliseconds)
 WATCHDOG_INTERVAL_SECONDS = 5  # How often the watchdog checks for stuck state
-WATCHDOG_SILENCE_SECONDS = 15  # If no audio activity for this long, assume stuck and force-stop
+WATCHDOG_SPEECH_THRESHOLD = 0.05  # Audio level that indicates actual speech (not ambient noise)
+WATCHDOG_NO_SPEECH_SECONDS = 15  # Force-stop after this long without speech detected
+WATCHDOG_MAX_RECORDING_SECONDS = 180  # Absolute max recording duration (3 min hard limit)
 
 # Logging configuration
 LOG_FILE = Path.home() / "whisper-dictate" / "dictate.log"
@@ -174,7 +176,7 @@ class WhisperDictate:
         self._shutdown_requested = False
         self._recording_start_time = None
         self._watchdog_timer = None
-        self._last_audio_activity = None  # Timestamp of last non-silent audio chunk
+        self._last_speech_activity = None  # Timestamp of last speech-level audio (above ambient noise)
 
         # Log available audio devices
         logger.info("Available audio devices:")
@@ -192,9 +194,9 @@ class WhisperDictate:
             logger.warning(f"Audio status: {status}")
         if self.recording:
             self.audio_data.append(indata.copy())
-            # Track audio activity for the watchdog
-            if np.abs(indata).mean() > SILENCE_THRESHOLD:
-                self._last_audio_activity = time.time()
+            # Track speech activity for the watchdog (higher threshold than silence trimming)
+            if np.abs(indata).mean() > WATCHDOG_SPEECH_THRESHOLD:
+                self._last_speech_activity = time.time()
 
     def trim_silence(self, audio):
         """Trim silence from beginning and end of audio"""
@@ -248,28 +250,45 @@ class WhisperDictate:
         return devices
 
     def _start_watchdog(self):
-        """Start a watchdog that detects stuck recording via audio silence.
+        """Start a watchdog that detects stuck recording via two independent checks:
 
-        Does NOT limit recording duration — you can dictate as long as you want.
-        Monitors actual audio activity: if no sound above the silence threshold
-        is detected for WATCHDOG_SILENCE_SECONDS, the user has stopped talking
-        and pynput likely missed the key-release. Force-stops to release the mic.
+        1. Speech silence: If no speech-level audio (above ambient noise) is detected
+           for WATCHDOG_NO_SPEECH_SECONDS, the user has stopped talking. This uses a
+           higher threshold (WATCHDOG_SPEECH_THRESHOLD=0.05) than silence trimming
+           (SILENCE_THRESHOLD=0.01) to avoid being fooled by room ambient noise.
 
-        This approach is independent of pynput key state, which is unreliable
-        on macOS (the root cause of the stuck mic bug).
+        2. Hard max: Absolute recording cap at WATCHDOG_MAX_RECORDING_SECONDS (3 min).
+           Even during active speech, no single dictation should exceed this. This is
+           the ultimate backstop that cannot be fooled by any signal.
+
+        Both checks are independent of pynput key state, which is unreliable on macOS.
         """
         self._cancel_watchdog()
-        self._last_audio_activity = time.time()
+        self._last_speech_activity = time.time()
 
         def _watchdog_check():
             if not self.recording:
                 return
 
-            silence_duration = time.time() - self._last_audio_activity
-            if silence_duration >= WATCHDOG_SILENCE_SECONDS:
-                elapsed = time.time() - self._recording_start_time
+            now = time.time()
+            elapsed = now - self._recording_start_time
+            no_speech_for = now - self._last_speech_activity
+
+            # Check 1: Hard max recording duration (absolute backstop)
+            if elapsed >= WATCHDOG_MAX_RECORDING_SECONDS:
                 logger.warning(
-                    f"Watchdog: no audio activity for {silence_duration:.0f}s "
+                    f"Watchdog: max recording duration reached ({elapsed:.0f}s). "
+                    f"Force-stopping to release mic."
+                )
+                self.ctrl_pressed = False
+                self.space_pressed = False
+                self.stop_recording()
+                return
+
+            # Check 2: No speech detected for too long
+            if no_speech_for >= WATCHDOG_NO_SPEECH_SECONDS:
+                logger.warning(
+                    f"Watchdog: no speech for {no_speech_for:.0f}s "
                     f"(total recording: {elapsed:.0f}s). "
                     f"Force-stopping to release mic."
                 )

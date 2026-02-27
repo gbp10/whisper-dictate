@@ -11,7 +11,7 @@ A simple, free, and local voice dictation tool for macOS using OpenAI's Whisper 
 - Auto-pastes transcribed text at cursor position
 - Automatic audio device fallback
 - Automatic silence trimming
-- Dual watchdog: auto-releases mic after 15s of no speech or 3 min hard max
+- Dual watchdog: auto-releases mic after 30s of no speech or 5 min hard max
 - Robust audio stream cleanup on all exit paths
 - Log rotation (max 1MB, keeps 3 backups)
 
@@ -100,8 +100,8 @@ Edit `~/whisper-dictate/dictate.py` to change settings:
 | `MODEL_NAME` | `medium` | `tiny`, `base`, `small`, `medium`, `large` |
 | `LANGUAGE` | `en` | `en`, `es`, `fr`, `de`, `it`, `None` (auto-detect) |
 | `SILENCE_THRESHOLD` | `0.01` | Lower = more sensitive |
-| `WATCHDOG_NO_SPEECH_SECONDS` | `15` | Force-stop after this many seconds without speech |
-| `WATCHDOG_MAX_RECORDING_SECONDS` | `180` | Absolute max recording duration (3 min hard limit) |
+| `WATCHDOG_NO_SPEECH_SECONDS` | `30` | Force-stop after this many seconds without speech |
+| `WATCHDOG_MAX_RECORDING_SECONDS` | `300` | Absolute max recording duration (5 min hard limit) |
 | `LOG_MAX_BYTES` | `1MB` | Max log file size before rotation |
 
 After editing, restart the service:
@@ -147,7 +147,7 @@ After editing, restart the service:
 
 ### Microphone stuck / locked
 - This is caused by macOS missing the key-release event, leaving the audio stream open
-- The watchdog auto-stops after 15s without speech or 3 min max recording duration
+- The watchdog auto-stops after 30s without speech or 5 min max recording duration
 - To manually recover: `pkill -9 -f dictate.py` then restart
 
 ### Hotkey not working

@@ -35,9 +35,9 @@ SILENCE_THRESHOLD = 0.01  # Audio level below this is considered silence
 SILENCE_TRIM_MS = 100  # Keep this much silence at edges (milliseconds)
 MIN_RECORDING_SECONDS = 0.5  # Ignore recordings shorter than this (prevents hallucinations)
 WATCHDOG_INTERVAL_SECONDS = 5  # How often the watchdog checks for stuck state
-WATCHDOG_SPEECH_THRESHOLD = 0.05  # Audio level that indicates actual speech (not ambient noise)
-WATCHDOG_NO_SPEECH_SECONDS = 15  # Force-stop after this long without speech detected
-WATCHDOG_MAX_RECORDING_SECONDS = 180  # Absolute max recording duration (3 min hard limit)
+WATCHDOG_SPEECH_THRESHOLD = 0.001  # Audio level that indicates actual speech (not ambient noise)
+WATCHDOG_NO_SPEECH_SECONDS = 30  # Force-stop after this long without speech detected
+WATCHDOG_MAX_RECORDING_SECONDS = 300  # Absolute max recording duration (5 min hard limit)
 
 # Known Whisper hallucinations (model artifacts from training data, not real transcriptions)
 HALLUCINATION_PATTERNS = [

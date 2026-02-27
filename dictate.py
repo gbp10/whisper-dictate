@@ -36,7 +36,7 @@ SILENCE_TRIM_MS = 100  # Keep this much silence at edges (milliseconds)
 MIN_RECORDING_SECONDS = 0.5  # Ignore recordings shorter than this (prevents hallucinations)
 WATCHDOG_INTERVAL_SECONDS = 5  # How often the watchdog checks for stuck state
 WATCHDOG_SPEECH_THRESHOLD = 0.001  # Audio level that indicates actual speech (not ambient noise)
-WATCHDOG_NO_SPEECH_SECONDS = 30  # Force-stop after this long without speech detected
+WATCHDOG_NO_SPEECH_SECONDS = 60  # Force-stop after this long without speech detected
 WATCHDOG_MAX_RECORDING_SECONDS = 300  # Absolute max recording duration (5 min hard limit)
 
 # Known Whisper hallucinations (model artifacts from training data, not real transcriptions)
@@ -272,15 +272,17 @@ class WhisperDictate:
         """Start a watchdog that detects stuck recording via two independent checks:
 
         1. Speech silence: If no speech-level audio (above ambient noise) is detected
-           for WATCHDOG_NO_SPEECH_SECONDS, the user has stopped talking. This uses a
-           higher threshold (WATCHDOG_SPEECH_THRESHOLD=0.05) than silence trimming
-           (SILENCE_THRESHOLD=0.01) to avoid being fooled by room ambient noise.
+           for WATCHDOG_NO_SPEECH_SECONDS (60s), the user has likely stopped talking
+           and pynput missed the key-release event. Uses WATCHDOG_SPEECH_THRESHOLD
+           (0.001) which is above typical ambient noise but catches real speech.
 
-        2. Hard max: Absolute recording cap at WATCHDOG_MAX_RECORDING_SECONDS (3 min).
+        2. Hard max: Absolute recording cap at WATCHDOG_MAX_RECORDING_SECONDS (5 min).
            Even during active speech, no single dictation should exceed this. This is
            the ultimate backstop that cannot be fooled by any signal.
 
         Both checks are independent of pynput key state, which is unreliable on macOS.
+        The watchdog is generous by design - it only exists as a fallback for missed
+        key-release events. Normal recordings stop instantly when Ctrl+Space is released.
         """
         self._cancel_watchdog()
         self._last_speech_activity = time.time()

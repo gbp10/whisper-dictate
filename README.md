@@ -11,7 +11,7 @@ A simple, free, and local voice dictation tool for macOS using OpenAI's Whisper 
 - Auto-pastes transcribed text at cursor position
 - Automatic audio device fallback
 - Automatic silence trimming
-- Dual watchdog: auto-releases mic after 30s of no speech or 5 min hard max
+- Dual watchdog: auto-releases mic after 60s of no speech or 5 min hard max
 - Robust audio stream cleanup on all exit paths
 - Log rotation (max 1MB, keeps 3 backups)
 
@@ -100,7 +100,7 @@ Edit `~/whisper-dictate/dictate.py` to change settings:
 | `MODEL_NAME` | `medium` | `tiny`, `base`, `small`, `medium`, `large` |
 | `LANGUAGE` | `en` | `en`, `es`, `fr`, `de`, `it`, `None` (auto-detect) |
 | `SILENCE_THRESHOLD` | `0.01` | Lower = more sensitive |
-| `WATCHDOG_NO_SPEECH_SECONDS` | `30` | Force-stop after this many seconds without speech |
+| `WATCHDOG_NO_SPEECH_SECONDS` | `60` | Force-stop after this many seconds without speech |
 | `WATCHDOG_MAX_RECORDING_SECONDS` | `300` | Absolute max recording duration (5 min hard limit) |
 | `LOG_MAX_BYTES` | `1MB` | Max log file size before rotation |
 

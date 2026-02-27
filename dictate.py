@@ -34,6 +34,9 @@ LANGUAGE = "en"  # None = auto-detect, or "en", "es", "fr", etc.
 SILENCE_THRESHOLD = 0.01  # Audio level below this is considered silence
 SILENCE_TRIM_MS = 100  # Keep this much silence at edges (milliseconds)
 MIN_RECORDING_SECONDS = 0.5  # Ignore recordings shorter than this (prevents hallucinations)
+# Whisper initial_prompt conditions the model's style. It can leak into output, so we
+# store it as a constant and strip it from transcriptions if detected.
+WHISPER_INITIAL_PROMPT = "Transcribe spoken English accurately with proper punctuation."
 WATCHDOG_INTERVAL_SECONDS = 5  # How often the watchdog checks for stuck state
 WATCHDOG_SPEECH_THRESHOLD = 0.001  # Audio level that indicates actual speech (not ambient noise)
 WATCHDOG_NO_SPEECH_SECONDS = 60  # Force-stop after this long without speech detected
@@ -41,6 +44,8 @@ WATCHDOG_MAX_RECORDING_SECONDS = 300  # Absolute max recording duration (5 min h
 
 # Known Whisper hallucinations (model artifacts from training data, not real transcriptions)
 HALLUCINATION_PATTERNS = [
+    "transcribe spoken english accurately with proper punctuation.",
+    "transcribe spoken english accurately with proper punctuation",
     "transcribed by https://otter.ai",
     "otter.ai",
     "thanks for watching",
@@ -444,16 +449,24 @@ class WhisperDictate:
                 task="transcribe",
                 without_timestamps=True,
                 condition_on_previous_text=False,
-                initial_prompt="Transcribe spoken English accurately with proper punctuation."
+                initial_prompt=WHISPER_INITIAL_PROMPT
             )
             text = result["text"].strip()
+
+            # Strip leaked initial_prompt from the beginning of transcription.
+            # Whisper sometimes regurgitates the prompt when the audio starts softly.
+            prompt_lower = WHISPER_INITIAL_PROMPT.lower().rstrip(".")
+            text_lower = text.lower()
+            if text_lower.startswith(prompt_lower):
+                text = text[len(prompt_lower):].lstrip(" .,;:").strip()
+                logger.warning(f"Stripped leaked initial_prompt from transcription")
 
             # Show detected language if auto-detecting
             if LANGUAGE is None and "language" in result:
                 logger.info(f"Detected language: {result['language']}")
 
             if not text:
-                logger.warning("No speech detected")
+                logger.warning("No speech detected (after prompt stripping)")
                 return
 
             # Filter out known Whisper hallucinations

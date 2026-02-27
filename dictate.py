@@ -33,10 +33,29 @@ MODEL_NAME = "medium"  # Options: tiny, base, small, medium, large
 LANGUAGE = "en"  # None = auto-detect, or "en", "es", "fr", etc.
 SILENCE_THRESHOLD = 0.01  # Audio level below this is considered silence
 SILENCE_TRIM_MS = 100  # Keep this much silence at edges (milliseconds)
+MIN_RECORDING_SECONDS = 0.5  # Ignore recordings shorter than this (prevents hallucinations)
 WATCHDOG_INTERVAL_SECONDS = 5  # How often the watchdog checks for stuck state
 WATCHDOG_SPEECH_THRESHOLD = 0.05  # Audio level that indicates actual speech (not ambient noise)
 WATCHDOG_NO_SPEECH_SECONDS = 15  # Force-stop after this long without speech detected
 WATCHDOG_MAX_RECORDING_SECONDS = 180  # Absolute max recording duration (3 min hard limit)
+
+# Known Whisper hallucinations (model artifacts from training data, not real transcriptions)
+HALLUCINATION_PATTERNS = [
+    "transcribed by https://otter.ai",
+    "otter.ai",
+    "thanks for watching",
+    "thank you for watching",
+    "subscribe to my channel",
+    "please subscribe",
+    "like and subscribe",
+    "see you in the next video",
+    "see you next time",
+    "the end",
+    "you",
+    "bye",
+    "bye bye",
+    "bye-bye",
+]
 
 # Logging configuration
 LOG_FILE = Path.home() / "whisper-dictate" / "dictate.log"
@@ -394,10 +413,16 @@ class WhisperDictate:
 
         # Combine audio chunks
         audio = np.concatenate(self.audio_data, axis=0).flatten()
+        duration = len(audio) / SAMPLE_RATE
+
+        # Reject recordings that are too short (prevents hallucinations on accidental taps)
+        if duration < MIN_RECORDING_SECONDS:
+            logger.warning(f"Recording too short ({duration:.2f}s < {MIN_RECORDING_SECONDS}s), ignoring")
+            return
 
         # Check if there's actual audio content
         audio_level = np.abs(audio).mean()
-        logger.info(f"Audio level: {audio_level:.6f}")
+        logger.info(f"Audio level: {audio_level:.6f} (duration: {duration:.2f}s)")
 
         if audio_level < 0.0001:
             logger.warning("Audio level too low - check microphone permissions or input device")
@@ -425,11 +450,17 @@ class WhisperDictate:
             if LANGUAGE is None and "language" in result:
                 logger.info(f"Detected language: {result['language']}")
 
-            if text:
-                logger.info(f"Transcribed: {text}")
-                self.type_text(text)
-            else:
+            if not text:
                 logger.warning("No speech detected")
+                return
+
+            # Filter out known Whisper hallucinations
+            if text.lower() in HALLUCINATION_PATTERNS:
+                logger.warning(f"Filtered hallucination: {text}")
+                return
+
+            logger.info(f"Transcribed: {text}")
+            self.type_text(text)
 
         except Exception as e:
             logger.error(f"Transcription error: {e}")

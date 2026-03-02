@@ -23,6 +23,8 @@ import logging
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 import multiprocessing
+import threading
+import queue
 try:
     from Quartz import CGEventSourceKeyState, kCGEventSourceStateHIDSystemState
     QUARTZ_AVAILABLE = True
@@ -43,6 +45,7 @@ MIN_RECORDING_SECONDS = 0.5  # Ignore recordings shorter than this (prevents hal
 WHISPER_INITIAL_PROMPT = "Transcribe spoken English accurately with proper punctuation."
 WATCHDOG_MAX_RECORDING_SECONDS = 300  # Absolute max recording duration (5 min hard limit)
 WATCHDOG_RELEASE_GRACE_SECONDS = 10  # After Quartz says keys released, wait this long before force-stop
+WATCHDOG_LOG_INTERVAL = 10  # Log watchdog status every N seconds during recording (avoids log spam)
 # macOS virtual key codes for Ctrl+Space (used by Quartz CGEventSourceKeyState)
 KEYCODE_SPACE = 49
 KEYCODE_CTRL_LEFT = 59
@@ -205,7 +208,17 @@ class WhisperDictate:
         self.listener = None
         self._shutdown_requested = False
         self._recording_start_time = None
-        self._quartz_release_detected_at = None  # When Quartz first saw keys released
+        self._quartz_release_detected_at = None
+        self._last_watchdog_log_time = 0  # Throttle verbose watchdog logs
+
+        # Async transcription: pynput callbacks return instantly, transcription
+        # happens in a background thread. This prevents macOS from disabling the
+        # event tap when callbacks take too long (>1s triggers tap disable).
+        self._transcription_queue = queue.Queue()
+        self._transcription_thread = threading.Thread(
+            target=self._transcription_worker, daemon=True
+        )
+        self._transcription_thread.start()
 
         # Log available audio devices
         logger.info("Available audio devices:")
@@ -216,7 +229,90 @@ class WhisperDictate:
 
         default_input = sd.query_devices(kind='input')
         logger.info(f"Using default input: {default_input['name']}")
+        logger.info(f"Quartz key state polling: {'available' if QUARTZ_AVAILABLE else 'NOT available'}")
 
+    # ========================================================================
+    # Async Transcription Worker
+    # ========================================================================
+    def _transcription_worker(self):
+        """Background thread that processes transcription jobs.
+
+        By moving transcription off the pynput callback thread, we ensure:
+        1. pynput callbacks return in <1ms (macOS won't disable the event tap)
+        2. Key events (including releases) are never missed during transcription
+        3. The main loop watchdog ticks uninterrupted
+        """
+        while True:
+            audio_chunks = self._transcription_queue.get()
+            if audio_chunks is None:
+                break  # Shutdown signal
+            try:
+                self._do_transcription(audio_chunks)
+            except Exception as e:
+                logger.error(f"Transcription worker error: {e}")
+
+    def _do_transcription(self, audio_chunks):
+        """Actually transcribe audio. Runs in the worker thread."""
+        audio = np.concatenate(audio_chunks, axis=0).flatten()
+        duration = len(audio) / SAMPLE_RATE
+
+        # Reject recordings that are too short (prevents hallucinations on accidental taps)
+        if duration < MIN_RECORDING_SECONDS:
+            logger.warning(f"Recording too short ({duration:.2f}s < {MIN_RECORDING_SECONDS}s), ignoring")
+            return
+
+        # Check if there's actual audio content
+        audio_level = np.abs(audio).mean()
+        logger.info(f"Audio level: {audio_level:.6f} (duration: {duration:.2f}s)")
+
+        if audio_level < 0.0001:
+            logger.warning("Audio level too low - check microphone permissions or input device")
+            return
+
+        # Trim silence
+        audio = self.trim_silence(audio)
+
+        logger.info("Transcribing...")
+
+        # Transcribe with Whisper
+        result = self.model.transcribe(
+            audio,
+            fp16=False,
+            language=LANGUAGE,
+            task="transcribe",
+            without_timestamps=True,
+            condition_on_previous_text=False,
+            initial_prompt=WHISPER_INITIAL_PROMPT
+        )
+        text = result["text"].strip()
+
+        # Strip leaked initial_prompt from the beginning of transcription.
+        # Whisper sometimes regurgitates the prompt when the audio starts softly.
+        prompt_lower = WHISPER_INITIAL_PROMPT.lower().rstrip(".")
+        text_lower = text.lower()
+        if text_lower.startswith(prompt_lower):
+            text = text[len(prompt_lower):].lstrip(" .,;:").strip()
+            logger.warning(f"Stripped leaked initial_prompt from transcription")
+
+        # Show detected language if auto-detecting
+        if LANGUAGE is None and "language" in result:
+            logger.info(f"Detected language: {result['language']}")
+
+        if not text:
+            logger.warning("No speech detected (after prompt stripping)")
+            return
+
+        # Filter out known Whisper hallucinations
+        if text.lower() in HALLUCINATION_PATTERNS:
+            logger.warning(f"Filtered hallucination: {text}")
+            return
+
+        logger.info(f"Transcribed: {text}")
+        self.type_text(text)
+
+    # ========================================================================
+    # Audio
+    # ========================================================================
     def audio_callback(self, indata, frames, time_info, status):
         """Callback for audio recording"""
         if status:
@@ -275,6 +371,24 @@ class WhisperDictate:
             logger.error(f"Error querying devices: {e}")
         return devices
 
+    def _force_release_stream(self):
+        """Force-close the audio stream and release the mic, handling all error cases"""
+        stream = self.stream
+        self.stream = None
+        if stream is not None:
+            try:
+                if stream.active:
+                    stream.stop()
+            except Exception as e:
+                logger.warning(f"Error stopping stream: {e}")
+            try:
+                stream.close()
+            except Exception as e:
+                logger.warning(f"Error closing stream: {e}")
+
+    # ========================================================================
+    # Watchdog (runs on main thread)
+    # ========================================================================
     @staticmethod
     def _is_hotkey_physically_held():
         """Check if Ctrl+Space is physically held down using macOS Quartz API.
@@ -288,7 +402,8 @@ class WhisperDictate:
             )
             space_held = CGEventSourceKeyState(kCGEventSourceStateHIDSystemState, KEYCODE_SPACE)
             return ctrl_held and space_held
-        except Exception:
+        except Exception as e:
+            logger.warning(f"Quartz key state check failed: {e}")
             return None
 
     def _watchdog_tick(self):
@@ -296,14 +411,6 @@ class WhisperDictate:
 
         This runs on the MAIN THREAD, which is guaranteed to execute regardless
         of what pynput's event tap thread or PortAudio's callback thread are doing.
-        Previous approaches using threading.Timer were unreliable because:
-        - Timer threads can be starved by pynput's CFRunLoop event tap
-        - Quartz API calls from timer threads may return stale data
-
-        Strategy:
-        1. Quartz key state check: If Quartz reports keys released for
-           WATCHDOG_RELEASE_GRACE_SECONDS consecutive seconds, force-stop.
-        2. Hard max: Absolute cap at WATCHDOG_MAX_RECORDING_SECONDS.
         """
         if not self.recording or self._recording_start_time is None:
             self._quartz_release_detected_at = None
@@ -311,6 +418,16 @@ class WhisperDictate:
 
         now = time.time()
         elapsed = now - self._recording_start_time
+
+        # Verbose logging every WATCHDOG_LOG_INTERVAL seconds during recording
+        if (now - self._last_watchdog_log_time) >= WATCHDOG_LOG_INTERVAL:
+            quartz_state = self._is_hotkey_physically_held()
+            logger.info(
+                f"Watchdog tick: recording for {elapsed:.0f}s, "
+                f"quartz_held={quartz_state}, "
+                f"pynput_ctrl={self.ctrl_pressed}, pynput_space={self.space_pressed}"
+            )
+            self._last_watchdog_log_time = now
 
         # Check 1: Hard max recording duration (absolute backstop, always works)
         if elapsed >= WATCHDOG_MAX_RECORDING_SECONDS:
@@ -353,21 +470,9 @@ class WhisperDictate:
                     logger.info("Watchdog: Quartz says keys held again, resetting release detection")
                 self._quartz_release_detected_at = None
 
-    def _force_release_stream(self):
-        """Force-close the audio stream and release the mic, handling all error cases"""
-        stream = self.stream
-        self.stream = None
-        if stream is not None:
-            try:
-                if stream.active:
-                    stream.stop()
-            except Exception as e:
-                logger.warning(f"Error stopping stream: {e}")
-            try:
-                stream.close()
-            except Exception as e:
-                logger.warning(f"Error closing stream: {e}")
-
+    # ========================================================================
+    # Recording control
+    # ========================================================================
     def start_recording(self):
         """Start recording audio with automatic device fallback"""
         if self.recording:
@@ -375,6 +480,7 @@ class WhisperDictate:
         self.audio_data = []
         self.recording = True
         self._recording_start_time = time.time()
+        self._last_watchdog_log_time = 0  # Reset so first tick logs immediately
 
         # Try default device first, then fallback to others
         devices_to_try = [(None, "default")]  # None = use system default
@@ -413,82 +519,32 @@ class WhisperDictate:
         self._recording_start_time = None
 
     def stop_recording(self):
-        """Stop recording and transcribe"""
+        """Stop recording and queue audio for async transcription.
+
+        CRITICAL: This method returns in <1ms. Transcription happens in the
+        background worker thread. This keeps pynput's event tap callback fast,
+        preventing macOS from disabling the tap and dropping future key events.
+        """
         if not self.recording:
             return
         self.recording = False
         self._recording_start_time = None
         self._quartz_release_detected_at = None
 
-        # Always force-release the mic stream
+        # Always force-release the mic stream FIRST (instant)
         self._force_release_stream()
 
-        if not self.audio_data:
+        # Grab the audio data and queue it for async transcription
+        audio_data = self.audio_data
+        self.audio_data = []
+        if audio_data:
+            self._transcription_queue.put(audio_data)
+        else:
             logger.warning("No audio recorded")
-            return
 
-        # Combine audio chunks
-        audio = np.concatenate(self.audio_data, axis=0).flatten()
-        duration = len(audio) / SAMPLE_RATE
-
-        # Reject recordings that are too short (prevents hallucinations on accidental taps)
-        if duration < MIN_RECORDING_SECONDS:
-            logger.warning(f"Recording too short ({duration:.2f}s < {MIN_RECORDING_SECONDS}s), ignoring")
-            return
-
-        # Check if there's actual audio content
-        audio_level = np.abs(audio).mean()
-        logger.info(f"Audio level: {audio_level:.6f} (duration: {duration:.2f}s)")
-
-        if audio_level < 0.0001:
-            logger.warning("Audio level too low - check microphone permissions or input device")
-            return
-
-        # Trim silence
-        audio = self.trim_silence(audio)
-
-        logger.info("Transcribing...")
-
-        try:
-            # Transcribe with Whisper
-            result = self.model.transcribe(
-                audio,
-                fp16=False,
-                language=LANGUAGE,
-                task="transcribe",
-                without_timestamps=True,
-                condition_on_previous_text=False,
-                initial_prompt=WHISPER_INITIAL_PROMPT
-            )
-            text = result["text"].strip()
-
-            # Strip leaked initial_prompt from the beginning of transcription.
-            # Whisper sometimes regurgitates the prompt when the audio starts softly.
-            prompt_lower = WHISPER_INITIAL_PROMPT.lower().rstrip(".")
-            text_lower = text.lower()
-            if text_lower.startswith(prompt_lower):
-                text = text[len(prompt_lower):].lstrip(" .,;:").strip()
-                logger.warning(f"Stripped leaked initial_prompt from transcription")
-
-            # Show detected language if auto-detecting
-            if LANGUAGE is None and "language" in result:
-                logger.info(f"Detected language: {result['language']}")
-
-            if not text:
-                logger.warning("No speech detected (after prompt stripping)")
-                return
-
-            # Filter out known Whisper hallucinations
-            if text.lower() in HALLUCINATION_PATTERNS:
-                logger.warning(f"Filtered hallucination: {text}")
-                return
-
-            logger.info(f"Transcribed: {text}")
-            self.type_text(text)
-
-        except Exception as e:
-            logger.error(f"Transcription error: {e}")
-
+    # ========================================================================
+    # Output
+    # ========================================================================
     def type_text(self, text):
         """Type the transcribed text at cursor position"""
         time.sleep(0.1)
@@ -506,6 +562,9 @@ class WhisperDictate:
         except Exception as e:
             logger.error(f"Error pasting text: {e}")
 
+    # ========================================================================
+    # Key handlers (run on pynput's event tap thread - must be FAST)
+    # ========================================================================
     def on_press(self, key):
         """Handle key press events"""
         try:
@@ -545,6 +604,9 @@ class WhisperDictate:
                 self.space_pressed = False
                 self.stop_recording()
 
+    # ========================================================================
+    # Lifecycle
+    # ========================================================================
     def cleanup(self, signum=None, frame=None):
         """Clean up resources properly"""
         if self._shutdown_requested:
@@ -558,6 +620,9 @@ class WhisperDictate:
 
         # Stop audio stream
         self._force_release_stream()
+
+        # Signal transcription worker to stop
+        self._transcription_queue.put(None)
 
         # Stop keyboard listener
         if self.listener:
@@ -582,6 +647,7 @@ class WhisperDictate:
         logger.info(f"Hotkey: Hold Ctrl+Space to record")
         logger.info(f"Model: {MODEL_NAME}")
         logger.info(f"Language: {'Auto-detect' if LANGUAGE is None else LANGUAGE}")
+        logger.info(f"Async transcription: enabled")
         logger.info("Press Ctrl+C to quit")
         logger.info("=" * 50)
 

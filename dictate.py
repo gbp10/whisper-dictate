@@ -24,6 +24,7 @@ from logging.handlers import RotatingFileHandler
 from pathlib import Path
 import multiprocessing
 import threading
+from Quartz import CGEventSourceKeyState, kCGEventSourceStateHIDSystemState
 
 # ============================================================================
 # Configuration
@@ -37,10 +38,12 @@ MIN_RECORDING_SECONDS = 0.5  # Ignore recordings shorter than this (prevents hal
 # Whisper initial_prompt conditions the model's style. It can leak into output, so we
 # store it as a constant and strip it from transcriptions if detected.
 WHISPER_INITIAL_PROMPT = "Transcribe spoken English accurately with proper punctuation."
-WATCHDOG_INTERVAL_SECONDS = 5  # How often the watchdog checks for stuck state
-WATCHDOG_SPEECH_THRESHOLD = 0.001  # Audio level that indicates actual speech (not ambient noise)
-WATCHDOG_NO_SPEECH_SECONDS = 60  # Force-stop after this long without speech detected
+WATCHDOG_POLL_SECONDS = 2  # How often the watchdog polls actual key state
 WATCHDOG_MAX_RECORDING_SECONDS = 300  # Absolute max recording duration (5 min hard limit)
+# macOS virtual key codes for Ctrl+Space (used by Quartz CGEventSourceKeyState)
+KEYCODE_SPACE = 49
+KEYCODE_CTRL_LEFT = 59
+KEYCODE_CTRL_RIGHT = 62
 
 # Known Whisper hallucinations (model artifacts from training data, not real transcriptions)
 HALLUCINATION_PATTERNS = [
@@ -200,7 +203,6 @@ class WhisperDictate:
         self._shutdown_requested = False
         self._recording_start_time = None
         self._watchdog_timer = None
-        self._last_speech_activity = None  # Timestamp of last speech-level audio (above ambient noise)
 
         # Log available audio devices
         logger.info("Available audio devices:")
@@ -218,9 +220,6 @@ class WhisperDictate:
             logger.warning(f"Audio status: {status}")
         if self.recording:
             self.audio_data.append(indata.copy())
-            # Track speech activity for the watchdog (higher threshold than silence trimming)
-            if np.abs(indata).mean() > WATCHDOG_SPEECH_THRESHOLD:
-                self._last_speech_activity = time.time()
 
     def trim_silence(self, audio):
         """Trim silence from beginning and end of audio"""
@@ -273,24 +272,31 @@ class WhisperDictate:
             logger.error(f"Error querying devices: {e}")
         return devices
 
+    @staticmethod
+    def _is_hotkey_physically_held():
+        """Check if Ctrl+Space is physically held down using macOS Quartz API.
+        This bypasses pynput entirely and queries the actual hardware key state."""
+        ctrl_held = (
+            CGEventSourceKeyState(kCGEventSourceStateHIDSystemState, KEYCODE_CTRL_LEFT) or
+            CGEventSourceKeyState(kCGEventSourceStateHIDSystemState, KEYCODE_CTRL_RIGHT)
+        )
+        space_held = CGEventSourceKeyState(kCGEventSourceStateHIDSystemState, KEYCODE_SPACE)
+        return ctrl_held and space_held
+
     def _start_watchdog(self):
-        """Start a watchdog that detects stuck recording via two independent checks:
+        """Start a watchdog that polls the actual macOS hardware key state.
 
-        1. Speech silence: If no speech-level audio (above ambient noise) is detected
-           for WATCHDOG_NO_SPEECH_SECONDS (60s), the user has likely stopped talking
-           and pynput missed the key-release event. Uses WATCHDOG_SPEECH_THRESHOLD
-           (0.001) which is above typical ambient noise but catches real speech.
+        pynput on macOS silently drops key-release events under CPU load, leaving
+        the recording stuck. Instead of relying on audio levels (which can't
+        distinguish ambient noise from speech), we poll the physical key state
+        via Quartz CGEventSourceKeyState every WATCHDOG_POLL_SECONDS (2s).
 
-        2. Hard max: Absolute recording cap at WATCHDOG_MAX_RECORDING_SECONDS (5 min).
-           Even during active speech, no single dictation should exceed this. This is
-           the ultimate backstop that cannot be fooled by any signal.
+        If Ctrl+Space is no longer physically held but recording is still active,
+        pynput missed the release -> force-stop immediately.
 
-        Both checks are independent of pynput key state, which is unreliable on macOS.
-        The watchdog is generous by design - it only exists as a fallback for missed
-        key-release events. Normal recordings stop instantly when Ctrl+Space is released.
+        A hard max of WATCHDOG_MAX_RECORDING_SECONDS (5 min) is the absolute backstop.
         """
         self._cancel_watchdog()
-        self._last_speech_activity = time.time()
 
         def _watchdog_check():
             if not self.recording:
@@ -298,7 +304,6 @@ class WhisperDictate:
 
             now = time.time()
             elapsed = now - self._recording_start_time
-            no_speech_for = now - self._last_speech_activity
 
             # Check 1: Hard max recording duration (absolute backstop)
             if elapsed >= WATCHDOG_MAX_RECORDING_SECONDS:
@@ -311,11 +316,11 @@ class WhisperDictate:
                 self.stop_recording()
                 return
 
-            # Check 2: No speech detected for too long
-            if no_speech_for >= WATCHDOG_NO_SPEECH_SECONDS:
+            # Check 2: Are the keys still physically held down?
+            if not self._is_hotkey_physically_held():
                 logger.warning(
-                    f"Watchdog: no speech for {no_speech_for:.0f}s "
-                    f"(total recording: {elapsed:.0f}s). "
+                    f"Watchdog: Ctrl+Space no longer physically held "
+                    f"(pynput missed release after {elapsed:.1f}s). "
                     f"Force-stopping to release mic."
                 )
                 self.ctrl_pressed = False
@@ -325,13 +330,13 @@ class WhisperDictate:
 
             # Re-schedule watchdog
             self._watchdog_timer = threading.Timer(
-                WATCHDOG_INTERVAL_SECONDS, _watchdog_check
+                WATCHDOG_POLL_SECONDS, _watchdog_check
             )
             self._watchdog_timer.daemon = True
             self._watchdog_timer.start()
 
         self._watchdog_timer = threading.Timer(
-            WATCHDOG_INTERVAL_SECONDS, _watchdog_check
+            WATCHDOG_POLL_SECONDS, _watchdog_check
         )
         self._watchdog_timer.daemon = True
         self._watchdog_timer.start()

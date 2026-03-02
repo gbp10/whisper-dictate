@@ -23,8 +23,11 @@ import logging
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 import multiprocessing
-import threading
-from Quartz import CGEventSourceKeyState, kCGEventSourceStateHIDSystemState
+try:
+    from Quartz import CGEventSourceKeyState, kCGEventSourceStateHIDSystemState
+    QUARTZ_AVAILABLE = True
+except ImportError:
+    QUARTZ_AVAILABLE = False
 
 # ============================================================================
 # Configuration
@@ -38,8 +41,8 @@ MIN_RECORDING_SECONDS = 0.5  # Ignore recordings shorter than this (prevents hal
 # Whisper initial_prompt conditions the model's style. It can leak into output, so we
 # store it as a constant and strip it from transcriptions if detected.
 WHISPER_INITIAL_PROMPT = "Transcribe spoken English accurately with proper punctuation."
-WATCHDOG_POLL_SECONDS = 2  # How often the watchdog polls actual key state
 WATCHDOG_MAX_RECORDING_SECONDS = 300  # Absolute max recording duration (5 min hard limit)
+WATCHDOG_RELEASE_GRACE_SECONDS = 10  # After Quartz says keys released, wait this long before force-stop
 # macOS virtual key codes for Ctrl+Space (used by Quartz CGEventSourceKeyState)
 KEYCODE_SPACE = 49
 KEYCODE_CTRL_LEFT = 59
@@ -202,7 +205,7 @@ class WhisperDictate:
         self.listener = None
         self._shutdown_requested = False
         self._recording_start_time = None
-        self._watchdog_timer = None
+        self._quartz_release_detected_at = None  # When Quartz first saw keys released
 
         # Log available audio devices
         logger.info("Available audio devices:")
@@ -275,77 +278,80 @@ class WhisperDictate:
     @staticmethod
     def _is_hotkey_physically_held():
         """Check if Ctrl+Space is physically held down using macOS Quartz API.
-        This bypasses pynput entirely and queries the actual hardware key state."""
-        ctrl_held = (
-            CGEventSourceKeyState(kCGEventSourceStateHIDSystemState, KEYCODE_CTRL_LEFT) or
-            CGEventSourceKeyState(kCGEventSourceStateHIDSystemState, KEYCODE_CTRL_RIGHT)
-        )
-        space_held = CGEventSourceKeyState(kCGEventSourceStateHIDSystemState, KEYCODE_SPACE)
-        return ctrl_held and space_held
-
-    def _start_watchdog(self):
-        """Start a watchdog that polls the actual macOS hardware key state.
-
-        pynput on macOS silently drops key-release events under CPU load, leaving
-        the recording stuck. Instead of relying on audio levels (which can't
-        distinguish ambient noise from speech), we poll the physical key state
-        via Quartz CGEventSourceKeyState every WATCHDOG_POLL_SECONDS (2s).
-
-        If Ctrl+Space is no longer physically held but recording is still active,
-        pynput missed the release -> force-stop immediately.
-
-        A hard max of WATCHDOG_MAX_RECORDING_SECONDS (5 min) is the absolute backstop.
-        """
-        self._cancel_watchdog()
-
-        def _watchdog_check():
-            if not self.recording:
-                return
-
-            now = time.time()
-            elapsed = now - self._recording_start_time
-
-            # Check 1: Hard max recording duration (absolute backstop)
-            if elapsed >= WATCHDOG_MAX_RECORDING_SECONDS:
-                logger.warning(
-                    f"Watchdog: max recording duration reached ({elapsed:.0f}s). "
-                    f"Force-stopping to release mic."
-                )
-                self.ctrl_pressed = False
-                self.space_pressed = False
-                self.stop_recording()
-                return
-
-            # Check 2: Are the keys still physically held down?
-            if not self._is_hotkey_physically_held():
-                logger.warning(
-                    f"Watchdog: Ctrl+Space no longer physically held "
-                    f"(pynput missed release after {elapsed:.1f}s). "
-                    f"Force-stopping to release mic."
-                )
-                self.ctrl_pressed = False
-                self.space_pressed = False
-                self.stop_recording()
-                return
-
-            # Re-schedule watchdog
-            self._watchdog_timer = threading.Timer(
-                WATCHDOG_POLL_SECONDS, _watchdog_check
+        Returns True if held, False if not held, None if Quartz is unavailable."""
+        if not QUARTZ_AVAILABLE:
+            return None
+        try:
+            ctrl_held = (
+                CGEventSourceKeyState(kCGEventSourceStateHIDSystemState, KEYCODE_CTRL_LEFT) or
+                CGEventSourceKeyState(kCGEventSourceStateHIDSystemState, KEYCODE_CTRL_RIGHT)
             )
-            self._watchdog_timer.daemon = True
-            self._watchdog_timer.start()
+            space_held = CGEventSourceKeyState(kCGEventSourceStateHIDSystemState, KEYCODE_SPACE)
+            return ctrl_held and space_held
+        except Exception:
+            return None
 
-        self._watchdog_timer = threading.Timer(
-            WATCHDOG_POLL_SECONDS, _watchdog_check
-        )
-        self._watchdog_timer.daemon = True
-        self._watchdog_timer.start()
+    def _watchdog_tick(self):
+        """Called from the main loop every ~0.5s. Checks if recording is stuck.
 
-    def _cancel_watchdog(self):
-        """Cancel the watchdog timer"""
-        if self._watchdog_timer is not None:
-            self._watchdog_timer.cancel()
-            self._watchdog_timer = None
+        This runs on the MAIN THREAD, which is guaranteed to execute regardless
+        of what pynput's event tap thread or PortAudio's callback thread are doing.
+        Previous approaches using threading.Timer were unreliable because:
+        - Timer threads can be starved by pynput's CFRunLoop event tap
+        - Quartz API calls from timer threads may return stale data
+
+        Strategy:
+        1. Quartz key state check: If Quartz reports keys released for
+           WATCHDOG_RELEASE_GRACE_SECONDS consecutive seconds, force-stop.
+        2. Hard max: Absolute cap at WATCHDOG_MAX_RECORDING_SECONDS.
+        """
+        if not self.recording or self._recording_start_time is None:
+            self._quartz_release_detected_at = None
+            return
+
+        now = time.time()
+        elapsed = now - self._recording_start_time
+
+        # Check 1: Hard max recording duration (absolute backstop, always works)
+        if elapsed >= WATCHDOG_MAX_RECORDING_SECONDS:
+            logger.warning(
+                f"Watchdog: max recording duration reached ({elapsed:.0f}s). "
+                f"Force-stopping to release mic."
+            )
+            self._quartz_release_detected_at = None
+            self.ctrl_pressed = False
+            self.space_pressed = False
+            self.stop_recording()
+            return
+
+        # Check 2: Quartz hardware key state (if available)
+        quartz_result = self._is_hotkey_physically_held()
+        if quartz_result is not None:
+            if not quartz_result:
+                # Keys NOT held according to Quartz
+                if self._quartz_release_detected_at is None:
+                    self._quartz_release_detected_at = now
+                    logger.info(
+                        f"Watchdog: Quartz says keys released "
+                        f"(recording for {elapsed:.1f}s). "
+                        f"Waiting {WATCHDOG_RELEASE_GRACE_SECONDS}s to confirm..."
+                    )
+                elif (now - self._quartz_release_detected_at) >= WATCHDOG_RELEASE_GRACE_SECONDS:
+                    logger.warning(
+                        f"Watchdog: Keys released for "
+                        f"{now - self._quartz_release_detected_at:.0f}s "
+                        f"(Quartz confirmed). Force-stopping to release mic."
+                    )
+                    self._quartz_release_detected_at = None
+                    self.ctrl_pressed = False
+                    self.space_pressed = False
+                    self.stop_recording()
+                    return
+            else:
+                # Keys still held, reset the release detection
+                if self._quartz_release_detected_at is not None:
+                    logger.info("Watchdog: Quartz says keys held again, resetting release detection")
+                self._quartz_release_detected_at = None
 
     def _force_release_stream(self):
         """Force-close the audio stream and release the mic, handling all error cases"""
@@ -392,8 +398,6 @@ class WhisperDictate:
                     logger.info(f"Recording with fallback device: {device_name}")
                 else:
                     logger.info("Recording... (release Ctrl+Space to stop)")
-                # Start watchdog to auto-stop if release event is missed
-                self._start_watchdog()
                 return  # Success
             except Exception as e:
                 last_error = e
@@ -414,7 +418,7 @@ class WhisperDictate:
             return
         self.recording = False
         self._recording_start_time = None
-        self._cancel_watchdog()
+        self._quartz_release_detected_at = None
 
         # Always force-release the mic stream
         self._force_release_stream()
@@ -550,7 +554,7 @@ class WhisperDictate:
         logger.info("Shutting down...")
         self.recording = False
         self._recording_start_time = None
-        self._cancel_watchdog()
+        self._quartz_release_detected_at = None
 
         # Stop audio stream
         self._force_release_stream()
@@ -600,6 +604,8 @@ class WhisperDictate:
         try:
             while self.listener.is_alive() and not self._shutdown_requested:
                 self.listener.join(timeout=0.5)
+                # Main-thread watchdog: check for stuck recording every 0.5s
+                self._watchdog_tick()
         except KeyboardInterrupt:
             pass
         finally:

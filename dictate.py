@@ -26,7 +26,15 @@ import multiprocessing
 import threading
 import queue
 try:
-    from Quartz import CGEventSourceKeyState, kCGEventSourceStateHIDSystemState
+    from Quartz import (
+        CGEventSourceKeyState, kCGEventSourceStateHIDSystemState,
+        CGEventTapCreate, CGEventTapEnable, CGEventGetIntegerValueField,
+        CGEventMaskBit, CFMachPortCreateRunLoopSource, CFRunLoopGetCurrent,
+        CFRunLoopAddSource, CFRunLoopRun, CFRunLoopStop,
+        kCGSessionEventTap, kCGHeadInsertEventTap, kCGEventTapOptionListenOnly,
+        kCGEventKeyUp, kCGEventFlagsChanged, kCGKeyboardEventKeycode,
+        kCFRunLoopDefaultMode,
+    )
     QUARTZ_AVAILABLE = True
 except ImportError:
     QUARTZ_AVAILABLE = False
@@ -44,7 +52,7 @@ MIN_RECORDING_SECONDS = 0.5  # Ignore recordings shorter than this (prevents hal
 # store it as a constant and strip it from transcriptions if detected.
 WHISPER_INITIAL_PROMPT = "Transcribe spoken English accurately with proper punctuation."
 WATCHDOG_MAX_RECORDING_SECONDS = 300  # Absolute max recording duration (5 min hard limit)
-WATCHDOG_RELEASE_GRACE_SECONDS = 10  # After Quartz says keys released, wait this long before force-stop
+WATCHDOG_RELEASE_GRACE_SECONDS = 10  # After independent monitor says keys released, wait this long before force-stop
 WATCHDOG_LOG_INTERVAL = 10  # Log watchdog status every N seconds during recording (avoids log spam)
 # macOS virtual key codes for Ctrl+Space (used by Quartz CGEventSourceKeyState)
 KEYCODE_SPACE = 49
@@ -188,6 +196,112 @@ def verify_permissions():
     return True
 
 # ============================================================================
+# Independent Key Monitor (bypasses pynput entirely)
+# ============================================================================
+class IndependentKeyMonitor:
+    """Monitors key state via a SEPARATE Quartz event tap on its own thread.
+
+    pynput's event tap drops key-release events under load, and
+    CGEventSourceKeyState(HIDSystemState) reflects the same corrupted state.
+    This monitor creates a second, listen-only event tap that runs on its own
+    CFRunLoop thread. Since it's listen-only and independent of pynput, it
+    reliably sees ALL key events including the releases pynput misses.
+    """
+
+    def __init__(self):
+        self.ctrl_held = False
+        self.space_held = False
+        self._lock = threading.Lock()
+        self._thread = None
+        self._run_loop = None
+        self.available = False
+
+    def start(self):
+        if not QUARTZ_AVAILABLE:
+            logger.warning("IndependentKeyMonitor: Quartz not available")
+            return
+
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def _run(self):
+        """Create a listen-only event tap and run its CFRunLoop."""
+        # Listen for key-up events and modifier flag changes
+        event_mask = CGEventMaskBit(kCGEventKeyUp) | CGEventMaskBit(kCGEventFlagsChanged)
+
+        tap = CGEventTapCreate(
+            kCGSessionEventTap,
+            kCGHeadInsertEventTap,
+            kCGEventTapOptionListenOnly,  # Listen only - never interferes
+            event_mask,
+            self._tap_callback,
+            None
+        )
+
+        if tap is None:
+            logger.warning("IndependentKeyMonitor: failed to create event tap (need Accessibility permission)")
+            return
+
+        source = CFMachPortCreateRunLoopSource(None, tap, 0)
+        run_loop = CFRunLoopGetCurrent()
+        CFRunLoopAddSource(run_loop, source, kCFRunLoopDefaultMode)
+        CGEventTapEnable(tap, True)
+
+        self.available = True
+        logger.info("IndependentKeyMonitor: started (separate event tap active)")
+
+        # This blocks the thread - CFRunLoopRun processes events
+        CFRunLoopRun()
+
+    def _tap_callback(self, proxy, event_type, event, refcon):
+        """Called by macOS for every key-up and modifier change event."""
+        try:
+            keycode = CGEventGetIntegerValueField(event, kCGKeyboardEventKeycode)
+
+            if event_type == kCGEventKeyUp:
+                if keycode == KEYCODE_SPACE:
+                    with self._lock:
+                        self.space_held = False
+
+            elif event_type == kCGEventFlagsChanged:
+                # For modifier keys, flags-changed fires on both press and release.
+                # On release, the modifier flag is cleared from the event flags.
+                # We track ctrl by keycode: if we get a flags-changed for ctrl keycode
+                # and the ctrl modifier bit is NOT set, it's a release.
+                if keycode in (KEYCODE_CTRL_LEFT, KEYCODE_CTRL_RIGHT):
+                    # Check if ctrl modifier is still active in the event flags
+                    # Ctrl flag = 0x40000 (kCGEventFlagMaskControl = 1 << 18)
+                    from Quartz import CGEventGetFlags
+                    flags = CGEventGetFlags(event)
+                    ctrl_flag = 1 << 18  # kCGEventFlagMaskControl
+                    with self._lock:
+                        self.ctrl_held = bool(flags & ctrl_flag)
+
+                elif keycode == KEYCODE_SPACE:
+                    # Space is not a modifier, shouldn't get flags-changed for it
+                    pass
+        except Exception as e:
+            logger.error(f"IndependentKeyMonitor callback error: {e}")
+
+        return event  # Must return the event for listen-only taps
+
+    def set_pressed(self, ctrl=None, space=None):
+        """Called by pynput on_press to sync press events (releases tracked independently)."""
+        with self._lock:
+            if ctrl is not None:
+                self.ctrl_held = ctrl
+            if space is not None:
+                self.space_held = space
+
+    def is_hotkey_held(self):
+        """Check if Ctrl+Space is held according to this independent monitor."""
+        if not self.available:
+            return None
+        with self._lock:
+            return self.ctrl_held and self.space_held
+
+
+# ============================================================================
 # Main Whisper Dictate Class
 # ============================================================================
 class WhisperDictate:
@@ -208,8 +322,14 @@ class WhisperDictate:
         self.listener = None
         self._shutdown_requested = False
         self._recording_start_time = None
-        self._quartz_release_detected_at = None
+        self._independent_release_detected_at = None
         self._last_watchdog_log_time = 0  # Throttle verbose watchdog logs
+
+        # Independent key monitor: separate Quartz event tap that catches
+        # key-release events pynput misses
+        self._key_monitor = IndependentKeyMonitor()
+        self._key_monitor.start()
+        time.sleep(0.3)  # Give the monitor thread time to create the event tap
 
         # Async transcription: pynput callbacks return instantly, transcription
         # happens in a background thread. This prevents macOS from disabling the
@@ -229,7 +349,7 @@ class WhisperDictate:
 
         default_input = sd.query_devices(kind='input')
         logger.info(f"Using default input: {default_input['name']}")
-        logger.info(f"Quartz key state polling: {'available' if QUARTZ_AVAILABLE else 'NOT available'}")
+        logger.info(f"Independent key monitor: {'active' if self._key_monitor.available else 'NOT available'}")
 
     # ========================================================================
     # Async Transcription Worker
@@ -389,31 +509,16 @@ class WhisperDictate:
     # ========================================================================
     # Watchdog (runs on main thread)
     # ========================================================================
-    @staticmethod
-    def _is_hotkey_physically_held():
-        """Check if Ctrl+Space is physically held down using macOS Quartz API.
-        Returns True if held, False if not held, None if Quartz is unavailable."""
-        if not QUARTZ_AVAILABLE:
-            return None
-        try:
-            ctrl_held = (
-                CGEventSourceKeyState(kCGEventSourceStateHIDSystemState, KEYCODE_CTRL_LEFT) or
-                CGEventSourceKeyState(kCGEventSourceStateHIDSystemState, KEYCODE_CTRL_RIGHT)
-            )
-            space_held = CGEventSourceKeyState(kCGEventSourceStateHIDSystemState, KEYCODE_SPACE)
-            return ctrl_held and space_held
-        except Exception as e:
-            logger.warning(f"Quartz key state check failed: {e}")
-            return None
-
     def _watchdog_tick(self):
         """Called from the main loop every ~0.5s. Checks if recording is stuck.
 
-        This runs on the MAIN THREAD, which is guaranteed to execute regardless
-        of what pynput's event tap thread or PortAudio's callback thread are doing.
+        Uses three layers of protection:
+        1. Independent key monitor (separate Quartz event tap) - most reliable
+        2. Hard max recording duration (300s) - absolute backstop
+        3. Diagnostic logging for debugging
         """
         if not self.recording or self._recording_start_time is None:
-            self._quartz_release_detected_at = None
+            self._independent_release_detected_at = None
             return
 
         now = time.time()
@@ -421,10 +526,10 @@ class WhisperDictate:
 
         # Verbose logging every WATCHDOG_LOG_INTERVAL seconds during recording
         if (now - self._last_watchdog_log_time) >= WATCHDOG_LOG_INTERVAL:
-            quartz_state = self._is_hotkey_physically_held()
+            monitor_state = self._key_monitor.is_hotkey_held()
             logger.info(
                 f"Watchdog tick: recording for {elapsed:.0f}s, "
-                f"quartz_held={quartz_state}, "
+                f"monitor_held={monitor_state}, "
                 f"pynput_ctrl={self.ctrl_pressed}, pynput_space={self.space_pressed}"
             )
             self._last_watchdog_log_time = now
@@ -435,40 +540,39 @@ class WhisperDictate:
                 f"Watchdog: max recording duration reached ({elapsed:.0f}s). "
                 f"Force-stopping to release mic."
             )
-            self._quartz_release_detected_at = None
+            self._independent_release_detected_at = None
             self.ctrl_pressed = False
             self.space_pressed = False
             self.stop_recording()
             return
 
-        # Check 2: Quartz hardware key state (if available)
-        quartz_result = self._is_hotkey_physically_held()
-        if quartz_result is not None:
-            if not quartz_result:
-                # Keys NOT held according to Quartz
-                if self._quartz_release_detected_at is None:
-                    self._quartz_release_detected_at = now
-                    logger.info(
-                        f"Watchdog: Quartz says keys released "
-                        f"(recording for {elapsed:.1f}s). "
-                        f"Waiting {WATCHDOG_RELEASE_GRACE_SECONDS}s to confirm..."
-                    )
-                elif (now - self._quartz_release_detected_at) >= WATCHDOG_RELEASE_GRACE_SECONDS:
-                    logger.warning(
-                        f"Watchdog: Keys released for "
-                        f"{now - self._quartz_release_detected_at:.0f}s "
-                        f"(Quartz confirmed). Force-stopping to release mic."
-                    )
-                    self._quartz_release_detected_at = None
-                    self.ctrl_pressed = False
-                    self.space_pressed = False
-                    self.stop_recording()
-                    return
-            else:
-                # Keys still held, reset the release detection
-                if self._quartz_release_detected_at is not None:
-                    logger.info("Watchdog: Quartz says keys held again, resetting release detection")
-                self._quartz_release_detected_at = None
+        # Check 2: Independent key monitor (separate event tap)
+        monitor_result = self._key_monitor.is_hotkey_held()
+        if monitor_result is not None and not monitor_result:
+            # Keys NOT held according to independent monitor
+            if self._independent_release_detected_at is None:
+                self._independent_release_detected_at = now
+                logger.info(
+                    f"Watchdog: independent monitor says keys released "
+                    f"(recording for {elapsed:.1f}s). "
+                    f"Waiting {WATCHDOG_RELEASE_GRACE_SECONDS}s to confirm..."
+                )
+            elif (now - self._independent_release_detected_at) >= WATCHDOG_RELEASE_GRACE_SECONDS:
+                logger.warning(
+                    f"Watchdog: Keys released for "
+                    f"{now - self._independent_release_detected_at:.0f}s "
+                    f"(independent monitor confirmed). Force-stopping to release mic."
+                )
+                self._independent_release_detected_at = None
+                self.ctrl_pressed = False
+                self.space_pressed = False
+                self.stop_recording()
+                return
+        else:
+            # Keys still held (or monitor unavailable), reset
+            if self._independent_release_detected_at is not None:
+                logger.info("Watchdog: monitor says keys held again, resetting")
+            self._independent_release_detected_at = None
 
     # ========================================================================
     # Recording control
@@ -529,7 +633,7 @@ class WhisperDictate:
             return
         self.recording = False
         self._recording_start_time = None
-        self._quartz_release_detected_at = None
+        self._independent_release_detected_at = None
 
         # Always force-release the mic stream FIRST (instant)
         self._force_release_stream()
@@ -570,8 +674,10 @@ class WhisperDictate:
         try:
             if key == keyboard.Key.ctrl or key == keyboard.Key.ctrl_l or key == keyboard.Key.ctrl_r:
                 self.ctrl_pressed = True
+                self._key_monitor.set_pressed(ctrl=True)
             elif key == keyboard.Key.space:
                 self.space_pressed = True
+                self._key_monitor.set_pressed(space=True)
 
             # Start recording when both keys are pressed
             if self.ctrl_pressed and self.space_pressed and not self.recording:
@@ -616,7 +722,7 @@ class WhisperDictate:
         logger.info("Shutting down...")
         self.recording = False
         self._recording_start_time = None
-        self._quartz_release_detected_at = None
+        self._independent_release_detected_at = None
 
         # Stop audio stream
         self._force_release_stream()

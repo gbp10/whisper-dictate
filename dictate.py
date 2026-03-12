@@ -496,14 +496,26 @@ class WhisperDictate:
         4. Clear _toggle_armed only after BOTH keys are fully released
         """
         try:
-            if key == keyboard.Key.ctrl or key == keyboard.Key.ctrl_l or key == keyboard.Key.ctrl_r:
+            logger.debug(f"on_press: key={key!r} type={type(key).__name__}")
+
+            is_ctrl = (key == keyboard.Key.ctrl or key == keyboard.Key.ctrl_l or key == keyboard.Key.ctrl_r)
+            is_space = (key == keyboard.Key.space)
+
+            # Also detect space by character for keyboards that report it as KeyCode
+            if not is_space and hasattr(key, 'char') and key.char == ' ':
+                is_space = True
+            if not is_space and hasattr(key, 'vk') and key.vk == 49:
+                is_space = True
+
+            if is_ctrl:
                 self._ctrl_held = True
-            elif key == keyboard.Key.space:
+            elif is_space:
                 self._space_held = True
 
             # Toggle when both keys are pressed together and not already armed
             if self._ctrl_held and self._space_held and not self._toggle_armed:
                 self._toggle_armed = True
+                logger.info(f"Toggle triggered: recording={self.recording} -> {'stop' if self.recording else 'start'}")
                 if not self.recording:
                     self.start_recording()
                 else:
@@ -519,9 +531,18 @@ class WhisperDictate:
         so the user can press Ctrl+Space again for the next toggle.
         """
         try:
-            if key == keyboard.Key.ctrl or key == keyboard.Key.ctrl_l or key == keyboard.Key.ctrl_r:
+            is_ctrl = (key == keyboard.Key.ctrl or key == keyboard.Key.ctrl_l or key == keyboard.Key.ctrl_r)
+            is_space = (key == keyboard.Key.space)
+
+            # Also detect space by character for keyboards that report it as KeyCode
+            if not is_space and hasattr(key, 'char') and key.char == ' ':
+                is_space = True
+            if not is_space and hasattr(key, 'vk') and key.vk == 49:
+                is_space = True
+
+            if is_ctrl:
                 self._ctrl_held = False
-            elif key == keyboard.Key.space:
+            elif is_space:
                 self._space_held = False
 
             # Reset toggle arm when both keys are released

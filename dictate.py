@@ -32,7 +32,7 @@ import queue
 SAMPLE_RATE = 16000
 MODEL_NAME = "medium"  # Options: tiny, base, small, medium, large
 LANGUAGE = "en"  # None = auto-detect, or "en", "es", "fr", etc.
-SILENCE_THRESHOLD = 0.01  # Audio level below this is considered silence
+SILENCE_THRESHOLD = 0.001  # Audio level below this is considered silence
 SILENCE_TRIM_MS = 100  # Keep this much silence at edges (milliseconds)
 MIN_RECORDING_SECONDS = 0.5  # Ignore recordings shorter than this (prevents hallucinations)
 # Whisper initial_prompt conditions the model's style. It can leak into output, so we

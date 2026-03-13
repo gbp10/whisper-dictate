@@ -202,11 +202,14 @@ class WhisperDictate:
         self._recording_start_time = None
         self._last_watchdog_log_time = 0
 
-        # Toggle mode: track Ctrl+Space combo presses to toggle recording
-        # on_press fires for both keys; we start/stop when BOTH are down together
+        # Toggle mode: press Ctrl+Space to start, press again to stop.
+        # Uses time-based debounce (not release-based arming) because macOS
+        # drops key-release events under CPU load. After a toggle, ignore all
+        # combo presses for TOGGLE_DEBOUNCE_SECONDS to prevent key-repeat.
         self._ctrl_held = False
         self._space_held = False
-        self._toggle_armed = False  # True = combo was pressed, waiting for full release before next toggle
+        self._last_toggle_time = 0  # Timestamp of last toggle action
+        self.TOGGLE_DEBOUNCE_SECONDS = 1.0  # Ignore combo presses within this window
 
         # Async transcription: pynput callbacks return instantly, transcription
         # happens in a background thread. This prevents macOS from disabling the
@@ -487,17 +490,13 @@ class WhisperDictate:
     def on_press(self, key):
         """Handle key press events — toggle recording on Ctrl+Space combo.
 
-        Toggle logic:
-        1. Track ctrl and space independently
-        2. When both are held simultaneously and we haven't already toggled:
-           - If not recording → start recording
-           - If recording → stop recording
-        3. Set _toggle_armed so we don't re-toggle on key repeat
-        4. Clear _toggle_armed only after BOTH keys are fully released
+        Uses time-based debounce instead of release-based arming because macOS
+        drops key-release events. After toggling, all combo presses within
+        TOGGLE_DEBOUNCE_SECONDS are ignored (prevents key-repeat re-triggers).
+        The next combo press AFTER the debounce window triggers the next toggle.
+        No dependency on release events whatsoever.
         """
         try:
-            logger.debug(f"on_press: key={key!r} type={type(key).__name__}")
-
             is_ctrl = (key == keyboard.Key.ctrl or key == keyboard.Key.ctrl_l or key == keyboard.Key.ctrl_r)
             is_space = (key == keyboard.Key.space)
 
@@ -512,29 +511,32 @@ class WhisperDictate:
             elif is_space:
                 self._space_held = True
 
-            # Toggle when both keys are pressed together and not already armed
-            if self._ctrl_held and self._space_held and not self._toggle_armed:
-                self._toggle_armed = True
-                logger.info(f"Toggle triggered: recording={self.recording} -> {'stop' if self.recording else 'start'}")
-                if not self.recording:
-                    self.start_recording()
-                else:
-                    self.stop_recording()
+            # Toggle when both keys are pressed and debounce window has elapsed
+            if self._ctrl_held and self._space_held:
+                now = time.time()
+                if (now - self._last_toggle_time) >= self.TOGGLE_DEBOUNCE_SECONDS:
+                    self._last_toggle_time = now
+                    if not self.recording:
+                        logger.info("Toggle: starting recording")
+                        self.start_recording()
+                    else:
+                        logger.info("Toggle: stopping recording")
+                        self.stop_recording()
         except Exception as e:
             logger.error(f"Key press error: {e}")
 
     def on_release(self, key):
-        """Handle key release events — only used to reset toggle arming.
+        """Handle key release events — reset key tracking flags.
 
-        We do NOT rely on release events for stopping recording (that was the
-        root cause of the stuck mic bug). Releases only reset _toggle_armed
-        so the user can press Ctrl+Space again for the next toggle.
+        Release events are NOT used for any critical logic (stopping recording,
+        arming toggles, etc.) because macOS drops them under CPU load. They only
+        reset _ctrl_held/_space_held so the combo detection in on_press works
+        correctly when releases DO arrive. If releases are dropped, the debounce
+        timer in on_press handles it gracefully.
         """
         try:
             is_ctrl = (key == keyboard.Key.ctrl or key == keyboard.Key.ctrl_l or key == keyboard.Key.ctrl_r)
             is_space = (key == keyboard.Key.space)
-
-            # Also detect space by character for keyboards that report it as KeyCode
             if not is_space and hasattr(key, 'char') and key.char == ' ':
                 is_space = True
             if not is_space and hasattr(key, 'vk') and key.vk == 49:
@@ -544,10 +546,6 @@ class WhisperDictate:
                 self._ctrl_held = False
             elif is_space:
                 self._space_held = False
-
-            # Reset toggle arm when both keys are released
-            if not self._ctrl_held and not self._space_held:
-                self._toggle_armed = False
         except Exception as e:
             logger.error(f"Key release error: {e}")
 

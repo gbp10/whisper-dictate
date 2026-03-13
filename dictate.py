@@ -500,15 +500,15 @@ class WhisperDictate:
             is_ctrl = (key == keyboard.Key.ctrl or key == keyboard.Key.ctrl_l or key == keyboard.Key.ctrl_r)
             is_space = (key == keyboard.Key.space)
 
-            # Also detect space by character for keyboards that report it as KeyCode
-            if not is_space and hasattr(key, 'char') and key.char == ' ':
+            # Fallback space detection for non-standard keyboard configs
+            if not is_space and hasattr(key, 'char') and key.char in (' ', '\x00'):
                 is_space = True
-            if not is_space and hasattr(key, 'vk') and key.vk == 49:
+            if not is_space and hasattr(key, 'vk') and getattr(key, 'vk', None) == 49:
                 is_space = True
 
             if is_ctrl:
                 self._ctrl_held = True
-            elif is_space:
+            if is_space:
                 self._space_held = True
 
             # Toggle when both keys are pressed and debounce window has elapsed

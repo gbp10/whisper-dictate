@@ -39,6 +39,8 @@ MIN_RECORDING_SECONDS = 0.5  # Ignore recordings shorter than this (prevents hal
 # store it as a constant and strip it from transcriptions if detected.
 WHISPER_INITIAL_PROMPT = "Transcribe spoken English accurately with proper punctuation."
 WATCHDOG_MAX_RECORDING_SECONDS = 120  # Hard max recording duration (2 min safety net)
+SOUND_START = "/System/Library/Sounds/Tink.aiff"  # Played when recording starts
+SOUND_STOP = "/System/Library/Sounds/Pop.aiff"  # Played when recording stops
 WATCHDOG_LOG_INTERVAL = 10  # Log watchdog status every N seconds during recording
 # macOS virtual key codes for Ctrl+Space (used by Quartz CGEventSourceKeyState)
 KEYCODE_SPACE = 49
@@ -201,7 +203,6 @@ class WhisperDictate:
         self._shutdown_requested = False
         self._recording_start_time = None
         self._last_watchdog_log_time = 0
-
         # Toggle mode: press Ctrl+Space to start, press again to stop.
         # Uses time-based debounce (not release-based arming) because macOS
         # drops key-release events under CPU load. After a toggle, ignore all
@@ -356,11 +357,31 @@ class WhisperDictate:
             logger.error(f"Error querying devices: {e}")
         return devices
 
+    def _play_sound(self, sound_path):
+        """Play a system sound asynchronously (non-blocking)."""
+        try:
+            subprocess.Popen(
+                ["afplay", sound_path],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL
+            )
+        except Exception:
+            pass  # Sound is non-critical, never block on failure
+
     def _force_release_stream(self):
-        """Force-close the audio stream and release the mic"""
+        """Force-close the audio stream and release the mic.
+
+        Uses a timeout thread because PortAudio stop/close can hang
+        if the device is in a bad state (disconnected, driver stall, etc.).
+        When the timeout fires, reinitializes sounddevice to force-release
+        the mic at the OS level.
+        """
         stream = self.stream
         self.stream = None
-        if stream is not None:
+        if stream is None:
+            return
+
+        def _close_stream():
             try:
                 if stream.active:
                     stream.stop()
@@ -370,6 +391,18 @@ class WhisperDictate:
                 stream.close()
             except Exception as e:
                 logger.warning(f"Error closing stream: {e}")
+
+        closer = threading.Thread(target=_close_stream, daemon=True)
+        closer.start()
+        closer.join(timeout=3.0)
+        if closer.is_alive():
+            logger.warning("Stream close timed out after 3s — forcing PortAudio reset")
+            try:
+                sd._terminate()
+                sd._initialize()
+                logger.info("PortAudio reset complete — mic should be released")
+            except Exception as e:
+                logger.error(f"PortAudio reset failed: {e}")
 
     # ========================================================================
     # Watchdog (runs on main thread)
@@ -406,6 +439,20 @@ class WhisperDictate:
         """Start recording audio with automatic device fallback"""
         if self.recording:
             return
+
+        # If PortAudio was left in a bad state (previous stream close timed out),
+        # reset it entirely before trying to open a new stream.
+        if self._portaudio_poisoned:
+            logger.info("Resetting PortAudio after previous stream close timeout...")
+            try:
+                sd._terminate()
+                sd._initialize()
+                self._portaudio_poisoned = False
+                logger.info("PortAudio reset successful")
+            except Exception as e:
+                logger.error(f"PortAudio reset failed: {e}")
+                # Continue anyway — the stream open below will fail if it's truly broken
+
         self.audio_data = []
         self.recording = True
         self._recording_start_time = time.time()
@@ -427,6 +474,7 @@ class WhisperDictate:
                     device=device_id
                 )
                 self.stream.start()
+                self._play_sound(SOUND_START)
                 if device_id is not None:
                     logger.info(f"Recording with fallback device: {device_name}")
                 else:
@@ -452,14 +500,13 @@ class WhisperDictate:
         self.recording = False
         self._recording_start_time = None
 
-        elapsed = 0
-        if self._recording_start_time is not None:
-            elapsed = time.time() - self._recording_start_time
+        self._play_sound(SOUND_STOP)
+        logger.info("Stopped recording. Releasing mic...")
 
-        # Always force-release the mic stream FIRST (instant)
+        # Force-release the mic stream (with timeout to prevent hangs)
         self._force_release_stream()
 
-        logger.info("Stopped recording.")
+        logger.info("Mic released.")
 
         # Grab the audio data and queue it for async transcription
         audio_data = self.audio_data

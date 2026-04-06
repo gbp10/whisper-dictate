@@ -440,19 +440,6 @@ class WhisperDictate:
         if self.recording:
             return
 
-        # If PortAudio was left in a bad state (previous stream close timed out),
-        # reset it entirely before trying to open a new stream.
-        if self._portaudio_poisoned:
-            logger.info("Resetting PortAudio after previous stream close timeout...")
-            try:
-                sd._terminate()
-                sd._initialize()
-                self._portaudio_poisoned = False
-                logger.info("PortAudio reset successful")
-            except Exception as e:
-                logger.error(f"PortAudio reset failed: {e}")
-                # Continue anyway — the stream open below will fail if it's truly broken
-
         self.audio_data = []
         self.recording = True
         self._recording_start_time = time.time()

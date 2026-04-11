@@ -507,16 +507,29 @@ class WhisperDictate:
     # Output
     # ========================================================================
     def type_text(self, text):
-        """Type the transcribed text at cursor position"""
+        """Type the transcribed text at cursor position.
+
+        Copies to clipboard (pbcopy) then simulates Cmd+V. The Cmd+V step
+        requires Accessibility permission for this Python binary, which is
+        separate from Input Monitoring. If Accessibility isn't granted, the
+        text lands in the clipboard but never gets pasted — so we log both
+        actions separately to make the failure mode obvious.
+        """
         time.sleep(0.1)
         try:
             process = subprocess.Popen(['pbcopy'], stdin=subprocess.PIPE)
             process.communicate(text.encode('utf-8'))
+            logger.info("Text copied to clipboard")
+        except Exception as e:
+            logger.error(f"Error copying to clipboard: {e}")
+            return
+
+        try:
             with self.keyboard_controller.pressed(keyboard.Key.cmd):
                 self.keyboard_controller.tap('v')
-            logger.info("Text pasted!")
+            logger.info("Cmd+V sent (text pasted if Accessibility permission granted)")
         except Exception as e:
-            logger.error(f"Error pasting text: {e}")
+            logger.error(f"Error sending Cmd+V: {e} — grant Accessibility permission in System Settings")
 
     # ========================================================================
     # Key handlers (run on pynput's event tap thread - must be FAST)

@@ -46,6 +46,17 @@ WATCHDOG_MAX_RECORDING_SECONDS = 300  # Hard max recording duration (5 min safet
 SOUND_START = "/System/Library/Sounds/Tink.aiff"  # Played when recording starts
 SOUND_STOP = "/System/Library/Sounds/Pop.aiff"  # Played when recording stops
 WATCHDOG_LOG_INTERVAL = 10  # Log watchdog status every N seconds during recording
+
+# Streaming (VAD-based incremental transcription).
+# When True, phrases are transcribed and pasted as you pause speaking, instead
+# of waiting until you toggle stop. Each pause closes a segment; the worker
+# transcribes it; the text appears at your cursor. Set False for the legacy
+# "transcribe everything at once on stop" behavior.
+STREAMING_MODE = True
+SEGMENT_PAUSE_SECONDS = 0.7  # Silence duration that closes a segment in streaming mode
+SEGMENT_SPEECH_THRESHOLD = 0.005  # Per-chunk amplitude above which we consider audio to be speech
+MIN_SEGMENT_SPEECH_SECONDS = 0.3  # Cumulative speech needed before VAD can close a segment
+MAX_SEGMENT_SECONDS = 30  # Force-close even without pause if a segment exceeds this
 # macOS virtual key codes for Ctrl+Space (used by Quartz CGEventSourceKeyState)
 KEYCODE_SPACE = 49
 KEYCODE_CTRL_LEFT = 59
@@ -235,7 +246,6 @@ class WhisperDictate:
         logger.info(f"Model '{MODEL_NAME}' loaded successfully!")
 
         self.recording = False
-        self.audio_data = []
         self.keyboard_controller = KeyboardController()
         self.stream = None
         self.listener = None
@@ -250,6 +260,15 @@ class WhisperDictate:
         self._space_held = False
         self._last_toggle_time = 0  # Timestamp of last toggle action
         self.TOGGLE_DEBOUNCE_SECONDS = 1.0  # Ignore combo presses within this window
+
+        # VAD streaming state — guarded by _segment_lock since the audio
+        # callback (PortAudio thread) and stop_recording (pynput thread)
+        # both mutate it.
+        self._segment_lock = threading.Lock()
+        self._segment_buffer = []          # list of np.ndarray chunks for current segment
+        self._segment_speech_frames = 0    # cumulative frames classified as speech
+        self._silence_frames = 0           # consecutive frames classified as silence
+        self._segment_index = 0            # 0 = first segment of recording (no leading space)
 
         # Async transcription: pynput callbacks return instantly, transcription
         # happens in a background thread. This prevents macOS from disabling the
@@ -276,22 +295,28 @@ class WhisperDictate:
     def _transcription_worker(self):
         """Background thread that processes transcription jobs."""
         while True:
-            audio_chunks = self._transcription_queue.get()
-            if audio_chunks is None:
+            item = self._transcription_queue.get()
+            if item is None:
                 break  # Shutdown signal
             try:
-                self._do_transcription(audio_chunks)
+                audio_chunks, segment_index = item
+                self._do_transcription(audio_chunks, segment_index)
             except Exception as e:
                 logger.error(f"Transcription worker error: {e}")
 
-    def _do_transcription(self, audio_chunks):
-        """Actually transcribe audio. Runs in the worker thread."""
+    def _do_transcription(self, audio_chunks, segment_index):
+        """Actually transcribe audio. Runs in the worker thread.
+
+        segment_index is 0 for the first segment of a recording (no leading
+        space prepended on paste), >0 for subsequent segments (leading space
+        prepended so phrases don't run together: "HelloWorld" -> "Hello World").
+        """
         audio = np.concatenate(audio_chunks, axis=0).flatten()
         duration = len(audio) / SAMPLE_RATE
 
-        # Reject recordings that are too short (prevents hallucinations on accidental taps)
+        # Reject segments that are too short (prevents hallucinations on accidental taps)
         if duration < MIN_RECORDING_SECONDS:
-            logger.warning(f"Recording too short ({duration:.2f}s < {MIN_RECORDING_SECONDS}s), ignoring")
+            logger.warning(f"Segment too short ({duration:.2f}s < {MIN_RECORDING_SECONDS}s), ignoring")
             return
 
         # Check if there's actual audio content
@@ -340,18 +365,70 @@ class WhisperDictate:
             logger.warning(f"Filtered hallucination: {text}")
             return
 
-        logger.info(f"Transcribed: {text}")
-        self.type_text(text)
+        logger.info(f"Transcribed (segment #{segment_index}): {text}")
+        # Non-first segments get a leading space so phrases don't run together
+        prepend_space = STREAMING_MODE and segment_index > 0
+        self.type_text(text, prepend_space=prepend_space)
 
     # ========================================================================
     # Audio
     # ========================================================================
     def audio_callback(self, indata, frames, time_info, status):
-        """Callback for audio recording"""
+        """PortAudio callback. Runs on PortAudio's thread — keep it FAST.
+
+        Appends incoming audio to the current segment buffer. In streaming
+        mode, also runs lightweight VAD: if we've seen >= MIN_SEGMENT_SPEECH_SECONDS
+        of speech and now have a >= SEGMENT_PAUSE_SECONDS pause (or hit max
+        segment duration), flush the segment to the transcription queue.
+        """
         if status:
             logger.warning(f"Audio status: {status}")
-        if self.recording:
-            self.audio_data.append(indata.copy())
+        if not self.recording:
+            return
+
+        chunk = indata.copy()
+        chunk_amplitude = float(np.abs(chunk).mean())
+
+        with self._segment_lock:
+            self._segment_buffer.append(chunk)
+            if chunk_amplitude >= SEGMENT_SPEECH_THRESHOLD:
+                self._silence_frames = 0
+                self._segment_speech_frames += frames
+            else:
+                self._silence_frames += frames
+
+            if STREAMING_MODE:
+                silence_secs = self._silence_frames / SAMPLE_RATE
+                speech_secs = self._segment_speech_frames / SAMPLE_RATE
+                seg_duration = sum(c.shape[0] for c in self._segment_buffer) / SAMPLE_RATE
+
+                ready = speech_secs >= MIN_SEGMENT_SPEECH_SECONDS
+                paused = silence_secs >= SEGMENT_PAUSE_SECONDS
+                too_long = seg_duration >= MAX_SEGMENT_SECONDS
+
+                if ready and (paused or too_long):
+                    if too_long and not paused:
+                        logger.info(f"Segment hit max duration ({seg_duration:.1f}s), force-flushing")
+                    self._flush_segment_locked()
+
+    def _flush_segment_locked(self):
+        """Move the current segment to the transcription queue. Caller MUST hold _segment_lock."""
+        if not self._segment_buffer:
+            return
+        if self._segment_speech_frames == 0:
+            # Buffer holds only silence (e.g., before user starts talking) — drop it
+            self._segment_buffer = []
+            self._silence_frames = 0
+            return
+
+        segment = self._segment_buffer
+        idx = self._segment_index
+        self._segment_buffer = []
+        self._segment_speech_frames = 0
+        self._silence_frames = 0
+        self._segment_index += 1
+        # Queue (audio_chunks, segment_index) — index decides leading-space behavior
+        self._transcription_queue.put((segment, idx))
 
     def trim_silence(self, audio):
         """Trim silence from beginning and end of audio"""
@@ -486,10 +563,22 @@ class WhisperDictate:
         if self.recording:
             return
 
-        self.audio_data = []
+        # Reset segment state for a fresh recording
+        with self._segment_lock:
+            self._segment_buffer = []
+            self._segment_speech_frames = 0
+            self._silence_frames = 0
+            self._segment_index = 0
+
         self.recording = True
         self._recording_start_time = time.time()
         self._last_watchdog_log_time = 0  # Reset so first tick logs immediately
+
+        # User-visible feedback that recording started (Option C: UX)
+        if STREAMING_MODE:
+            self._notify("Recording — phrases will appear as you pause")
+        else:
+            self._notify("Recording — press Ctrl+Space again to stop")
 
         # Try default device first, then fallback to others
         devices_to_try = [(None, "default")]
@@ -533,6 +622,11 @@ class WhisperDictate:
         hang cannot freeze the keyboard listener (which would lock the
         user out of even quitting via the hotkey). If close hangs, the
         cleanup thread triggers os._exit(75) and launchd respawns us.
+
+        Streaming mode: most segments are already in the transcription
+        queue (flushed on each pause); we just flush whatever's left in
+        the current segment buffer (the last partial phrase).
+        Legacy mode: the entire recording is one segment, flushed here.
         """
         if not self.recording:
             return
@@ -542,37 +636,35 @@ class WhisperDictate:
         self._play_sound(SOUND_STOP)
         logger.info("Stopped recording. Releasing mic in background...")
 
-        audio_data = self.audio_data
-        self.audio_data = []
+        # Flush any unsent audio (final partial phrase in streaming mode,
+        # or the entire recording in legacy mode)
+        with self._segment_lock:
+            had_pending = bool(self._segment_buffer) and self._segment_speech_frames > 0
+            self._flush_segment_locked()
+        if not had_pending and self._segment_index == 0:
+            logger.warning("No audio recorded")
 
-        # If thread spawn fails (resource exhaustion is the only realistic
-        # cause), fall back to inline cleanup. The pynput listener blocks
-        # for the duration, but that's far better than leaking the stream
-        # — the existing 120s recording watchdog requires recording=True
-        # and can't catch an orphaned-stream-with-recording-False state.
+        # Spawn cleanup thread (with inline fallback if Thread.start() fails —
+        # rare resource exhaustion case). Cleanup runs off the pynput listener
+        # thread so a stream-close hang can't freeze the keyboard.
         try:
             threading.Thread(
                 target=self._cleanup_after_stop,
-                args=(audio_data,),
                 daemon=True,
             ).start()
         except Exception as e:
             logger.error(f"Failed to spawn cleanup thread: {e!r} — running inline")
-            self._cleanup_after_stop(audio_data)
+            self._cleanup_after_stop()
 
-    def _cleanup_after_stop(self, audio_data):
-        """Release the stream and queue transcription. Runs in a worker thread."""
+    def _cleanup_after_stop(self):
+        """Release the audio stream. Transcription queue drains on its own."""
         self._force_release_stream()
         logger.info("Mic released.")
-        if audio_data:
-            self._transcription_queue.put(audio_data)
-        else:
-            logger.warning("No audio recorded")
 
     # ========================================================================
     # Output
     # ========================================================================
-    def type_text(self, text):
+    def type_text(self, text, prepend_space=False):
         """Type the transcribed text at cursor position.
 
         Copies to clipboard (pbcopy) then simulates Cmd+V. The Cmd+V step
@@ -580,7 +672,13 @@ class WhisperDictate:
         separate from Input Monitoring. If Accessibility isn't granted, the
         text lands in the clipboard but never gets pasted — so we log both
         actions separately to make the failure mode obvious.
+
+        prepend_space: in streaming mode, non-first segments get a leading
+        space so phrases don't concatenate ("HelloWorld" → "Hello World").
         """
+        if prepend_space and not text.startswith((' ', '\n', '\t')):
+            text = ' ' + text
+
         time.sleep(0.1)
         try:
             process = subprocess.Popen(['pbcopy'], stdin=subprocess.PIPE)
@@ -596,6 +694,20 @@ class WhisperDictate:
             logger.info("Cmd+V sent (text pasted if Accessibility permission granted)")
         except Exception as e:
             logger.error(f"Error sending Cmd+V: {e} — grant Accessibility permission in System Settings")
+
+    def _notify(self, message, title="Whisper Dictate"):
+        """Send a non-blocking macOS notification. Best-effort — never raises."""
+        try:
+            # Backslash and quote escaping for safe AppleScript embedding
+            safe_msg = message.replace('\\', '\\\\').replace('"', '\\"')
+            safe_title = title.replace('\\', '\\\\').replace('"', '\\"')
+            subprocess.Popen(
+                ['osascript', '-e',
+                 f'display notification "{safe_msg}" with title "{safe_title}"'],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            )
+        except Exception:
+            pass  # Notifications are non-critical
 
     # ========================================================================
     # Key handlers (run on pynput's event tap thread - must be FAST)
@@ -712,6 +824,13 @@ class WhisperDictate:
         logger.info(f"Model: {MODEL_NAME}")
         logger.info(f"Language: {'Auto-detect' if LANGUAGE is None else LANGUAGE}")
         logger.info("Async transcription: enabled")
+        if STREAMING_MODE:
+            logger.info(
+                f"Streaming: ON (VAD pause={SEGMENT_PAUSE_SECONDS}s, "
+                f"max segment={MAX_SEGMENT_SECONDS}s)"
+            )
+        else:
+            logger.info("Streaming: OFF (legacy: transcribe whole recording on stop)")
         logger.info(f"Hard timeout: {WATCHDOG_MAX_RECORDING_SECONDS}s")
         logger.info("Press Ctrl+C to quit")
         logger.info("=" * 50)

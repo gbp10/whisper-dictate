@@ -8,10 +8,13 @@ A simple, free, local voice dictation tool for macOS using OpenAI's Whisper mode
 
 - Toggle hotkey (Ctrl+Space) — press once to start, press again to stop
 - 100% local — your voice never leaves your machine
+- **Streaming output (VAD)**: phrases appear at your cursor as you pause speaking,
+  not all-at-once at the end. Disable with `STREAMING_MODE = False` for legacy mode.
 - Auto-pastes transcribed text at cursor position
 - Automatic audio device selection with fallback
 - Automatic silence trimming
 - Async transcription on a worker thread (keyboard listener never blocks)
+- macOS notification on recording start (subtle "is it on?" feedback)
 - Whisper hallucination filter (drops "Thanks for watching", etc.)
 - Single-instance lock (won't double-launch)
 - **Self-heal on stuck mic**: if PortAudio's stream-close ever hangs,
@@ -70,11 +73,14 @@ After installation, grant these in **System Settings > Privacy & Security**:
 
 ## Usage
 
-1. Press **Ctrl+Space** — recording starts (Tink sound plays)
-2. Speak clearly
-3. Press **Ctrl+Space** again — recording stops (Pop sound plays), text is transcribed and pasted at your cursor
+1. Press **Ctrl+Space** — recording starts (Tink sound + macOS notification)
+2. Speak in natural phrases with brief pauses between them
+3. **Each phrase appears at your cursor when you pause** (default streaming mode)
+4. Press **Ctrl+Space** again — recording stops (Pop sound), any final phrase is transcribed and pasted
 
 The 1-second debounce prevents key-repeat from accidentally toggling twice.
+
+> **Tip:** if you want all the text to arrive at once at the end (legacy behavior — useful when you don't want incremental edits to scatter), set `STREAMING_MODE = False` in `dictate.py` and restart the service.
 
 ## Service Management
 
@@ -113,6 +119,11 @@ Edit `~/whisper-dictate/dictate.py`, then `~/bin/run_whisper_dictate.sh restart`
 | `LOG_MAX_BYTES` | `1048576` (1 MB) | Rotate at this size |
 | `LOG_BACKUP_COUNT` | `3` | Keep this many rotated logs |
 | `TOGGLE_DEBOUNCE_SECONDS` | `1.0` | Min time between toggles (prevents key-repeat double-fires) |
+| `STREAMING_MODE` | `True` | Stream phrases as you pause; set False for legacy "transcribe-on-stop" |
+| `SEGMENT_PAUSE_SECONDS` | `0.7` | Silence duration that closes a streaming segment |
+| `SEGMENT_SPEECH_THRESHOLD` | `0.005` | Per-chunk amplitude treated as "speech" by VAD |
+| `MIN_SEGMENT_SPEECH_SECONDS` | `0.3` | Min speech accumulated before VAD can close a segment |
+| `MAX_SEGMENT_SECONDS` | `30` | Force-close even without pause if a segment exceeds this |
 
 ## Model Comparison
 
@@ -142,6 +153,17 @@ Edit `~/whisper-dictate/dictate.py`, then `~/bin/run_whisper_dictate.sh restart`
 ~/bin/run_whisper_dictate.sh        # Service control
 ~/Library/LaunchAgents/com.whisperdictate.plist  # launchd agent
 ```
+
+## How streaming works
+
+Whisper itself is a batch model — every transcription call processes a complete audio segment from start to end. To produce text incrementally, the audio callback runs lightweight Voice Activity Detection (VAD): each incoming audio chunk is classified as speech or silence based on its amplitude. When we've accumulated enough speech and then see a long-enough pause (`SEGMENT_PAUSE_SECONDS`), the segment is closed and queued for transcription. The worker thread transcribes each segment with the same `medium` Whisper model used in legacy mode, so accuracy is preserved.
+
+Each non-first segment of a recording gets a leading space prepended on paste, so phrases don't run together (`"Hello"` + `"world"` becomes `"Hello world"`, not `"Helloworld"`).
+
+Tradeoffs to be aware of:
+- Whisper inserts terminal punctuation per segment, so long sentences split by pauses may end up as multiple sentences
+- If you switch app focus mid-recording, mid-sentence text lands in the new app
+- CPU stays warm during recording (vs spike-on-stop in legacy mode)
 
 ## How the self-heal works
 

@@ -1,36 +1,40 @@
 # Whisper Dictate
 
-A simple, free, and local voice dictation tool for macOS using OpenAI's Whisper model.
+A simple, free, local voice dictation tool for macOS using OpenAI's Whisper model.
 
-**Hold Ctrl+Space to record, release to transcribe and paste.**
+**Press Ctrl+Space to start recording, press Ctrl+Space again to stop and paste.** (Toggle mode.)
 
 ## Features
 
-- Hold-to-record hotkey (Ctrl+Space)
-- 100% local - your voice never leaves your machine
+- Toggle hotkey (Ctrl+Space) — press once to start, press again to stop
+- 100% local — your voice never leaves your machine
 - Auto-pastes transcribed text at cursor position
-- Automatic audio device fallback
+- Automatic audio device selection with fallback
 - Automatic silence trimming
-- Hardware key state watchdog: polls macOS Quartz API to detect missed key-release, plus 5 min hard max
-- Robust audio stream cleanup on all exit paths
-- Log rotation (max 1MB, keeps 3 backups)
+- Async transcription on a worker thread (keyboard listener never blocks)
+- Whisper hallucination filter (drops "Thanks for watching", etc.)
+- Single-instance lock (won't double-launch)
+- **Self-heal on stuck mic**: if PortAudio's stream-close ever hangs,
+  the process exits with code 75 and launchd respawns it automatically
+- Log rotation (1MB max, 3 backups)
 
 ## Requirements
 
 - macOS (Apple Silicon or Intel)
 - Python 3.9+
-- ~1GB disk space for the Whisper model
-- ffmpeg (installed automatically)
+- ~1GB disk space for the Whisper `medium` model
+- ffmpeg (installed automatically by `install.sh`)
+- Homebrew (installed automatically if missing)
 
 ## Installation
 
-**One-liner (recommended):**
+**One-liner:**
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/gbp10/whisper-dictate/main/install.sh | bash
 ```
 
-**Or manually:**
+**Manual:**
 
 ```bash
 git clone https://github.com/gbp10/whisper-dictate.git ~/whisper-dictate
@@ -38,82 +42,80 @@ cd ~/whisper-dictate && bash install.sh
 ```
 
 The installer will:
-- Install Homebrew and ffmpeg (if needed)
+- Install Homebrew and ffmpeg (if missing)
 - Create a Python virtual environment at `~/whisper-official/`
-- Install all dependencies (openai-whisper, sounddevice, pynput, numpy)
-- Download the Whisper medium model (~769 MB)
-- Build the `WhisperDictate.app` with your system's paths
-- Create a launcher script at `~/bin/run_whisper_dictate.sh`
+- Install dependencies from `requirements.txt`
+- Download the Whisper `medium` model (~769 MB)
+- Build `WhisperDictate.app` with paths interpolated for your system
+- Create the launcher at `~/bin/run_whisper_dictate.sh`
+- Install and load a launchd agent at `~/Library/LaunchAgents/com.whisperdictate.plist`
+  with `KeepAlive` so the service self-heals after stuck-mic recovery
 
 ## Permissions (IMPORTANT)
 
-After installation, you **must** grant these permissions in **System Settings > Privacy & Security**:
+After installation, grant these in **System Settings > Privacy & Security**:
 
-### 1. Accessibility (required for Ctrl+Space hotkey)
+### 1. Accessibility (required for Ctrl+Space hotkey and paste)
 
 1. Open **System Settings > Privacy & Security > Accessibility**
-2. Click the **+** button
-3. Navigate to `~/whisper-dictate/` and add **WhisperDictate.app**
-4. Make sure the toggle is **ON**
+2. Click **+** and add `~/whisper-dictate/WhisperDictate.app`
+3. Toggle it **ON**
 
 ### 2. Microphone (required for recording)
 
 1. Open **System Settings > Privacy & Security > Microphone**
-2. Enable for **WhisperDictate** (it will appear after the first recording attempt)
+2. Toggle **WhisperDictate** ON (it appears after the first recording attempt)
 
-> **Note:** You must launch via `WhisperDictate.app` (not `python dictate.py` directly) for permissions to work. The installer configures this automatically.
+> Launch via `WhisperDictate.app` (which the installer's launchd plist does automatically), **not** `python dictate.py` directly. Permissions are scoped to the app bundle.
 
 ## Usage
 
-1. Hold **Ctrl+Space** to start recording
+1. Press **Ctrl+Space** — recording starts (Tink sound plays)
 2. Speak clearly
-3. Release **Ctrl+Space** to transcribe
-4. Text is automatically pasted at your cursor
+3. Press **Ctrl+Space** again — recording stops (Pop sound plays), text is transcribed and pasted at your cursor
 
-## Managing the Service
+The 1-second debounce prevents key-repeat from accidentally toggling twice.
+
+## Service Management
 
 ```bash
-# Start
+# Start (loads launchd agent — also auto-starts on login)
 ~/bin/run_whisper_dictate.sh start
 
-# Stop
+# Stop (unloads launchd agent — won't auto-restart)
 ~/bin/run_whisper_dictate.sh stop
 
 # Restart
 ~/bin/run_whisper_dictate.sh restart
 
-# Check status
+# Check status (queries launchd directly)
 ~/bin/run_whisper_dictate.sh status
 
-# View logs
+# Tail the log
 ~/bin/run_whisper_dictate.sh logs
 ```
 
-To auto-start on login, add `WhisperDictate.app` in **System Settings > General > Login Items**.
+> **If you previously added WhisperDictate to System Settings > Login Items, REMOVE it.** launchd's `RunAtLoad` handles auto-start now; both running together produces duplicate processes (the second one fails the single-instance lock and exits, but it's noisy).
 
 ## Configuration
 
-Edit `~/whisper-dictate/dictate.py` to change settings:
+Edit `~/whisper-dictate/dictate.py`, then `~/bin/run_whisper_dictate.sh restart`:
 
-| Setting | Default | Options |
-|---------|---------|---------|
+| Setting | Default | Notes |
+|---|---|---|
 | `MODEL_NAME` | `medium` | `tiny`, `base`, `small`, `medium`, `large` |
-| `LANGUAGE` | `en` | `en`, `es`, `fr`, `de`, `it`, `None` (auto-detect) |
-| `SILENCE_THRESHOLD` | `0.01` | Lower = more sensitive |
-| `WATCHDOG_POLL_SECONDS` | `2` | How often the watchdog polls hardware key state |
-| `WATCHDOG_MAX_RECORDING_SECONDS` | `300` | Absolute max recording duration (5 min hard limit) |
-| `LOG_MAX_BYTES` | `1MB` | Max log file size before rotation |
-
-After editing, restart the service:
-
-```bash
-~/bin/run_whisper_dictate.sh restart
-```
+| `LANGUAGE` | `en` | Set to `None` for auto-detect, or `"es"`, `"fr"`, etc. |
+| `SILENCE_THRESHOLD` | `0.001` | Lower = more aggressive silence trim |
+| `MIN_RECORDING_SECONDS` | `0.5` | Reject taps shorter than this (anti-hallucination) |
+| `WATCHDOG_MAX_RECORDING_SECONDS` | `120` | Hard max recording duration; auto-stops if you forget to toggle |
+| `LOG_MAX_BYTES` | `1048576` (1 MB) | Rotate at this size |
+| `LOG_BACKUP_COUNT` | `3` | Keep this many rotated logs |
+| `TOGGLE_DEBOUNCE_SECONDS` | `1.0` | Min time between toggles (prevents key-repeat double-fires) |
 
 ## Model Comparison
 
-| Model | Size | Speed | Accuracy | RAM Usage |
-|-------|------|-------|----------|-----------|
+| Model | Size | Speed | Accuracy | RAM |
+|---|---|---|---|---|
 | `tiny` | 39 MB | Fastest | Basic | ~1 GB |
 | `base` | 74 MB | Fast | Good | ~1 GB |
 | `small` | 244 MB | Medium | Better | ~2 GB |
@@ -124,44 +126,61 @@ After editing, restart the service:
 
 ```
 ~/whisper-dictate/
-├── dictate.py                  # Main script
-├── install.sh                  # Installer
-├── requirements.txt            # Python dependencies
-├── WhisperDictate.app/         # macOS app bundle (built by installer)
-├── dictate.log                 # Current log (rotates at 1MB)
-└── README.md                   # This file
+├── dictate.py                      # Main script
+├── install.sh                      # Installer
+├── requirements.txt                # Pinned Python deps
+├── WhisperDictate.app/             # macOS app bundle (rewritten by installer)
+├── dictate.log                     # Current log (rotates at 1MB; gitignored)
+├── dictate.stdout.log              # launchd-captured stdout
+├── dictate.stderr.log              # launchd-captured stderr
+├── .dictate.pid                    # Single-instance lockfile (gitignored)
+└── README.md
 
-~/whisper-official/             # Python virtual environment
-~/bin/run_whisper_dictate.sh    # Launcher script
+~/whisper-official/                 # Python venv
+~/bin/run_whisper_dictate.sh        # Service control
+~/Library/LaunchAgents/com.whisperdictate.plist  # launchd agent
 ```
+
+## How the self-heal works
+
+PortAudio's `stream.stop()` / `stream.close()` can hang in pathological states (driver stall, abrupt device disconnect). Calling `sd._terminate()` to recover deadlocks against the in-flight close (we observed this in production, holding the mic for 23 minutes).
+
+Instead, when the close-thread doesn't return within 3 seconds, `dictate.py` calls `os._exit(75)`. The kernel reaps the process and releases the mic. launchd's `KeepAlive: { SuccessfulExit: false }` then respawns the service. Total downtime: ~5–10 seconds (mostly Whisper model reload).
 
 ## Troubleshooting
 
 ### "This process is not trusted"
-- Add **WhisperDictate.app** (not Terminal or Python) to **Accessibility** in System Settings
-- Re-run the installer if needed: `cd ~/whisper-dictate && bash install.sh`
-
-### "Audio level too low"
-- Check **Microphone** permission in System Settings
-- Verify correct input device is selected in Sound settings
-
-### Microphone stuck / locked
-- This is caused by macOS missing the key-release event, leaving the audio stream open
-- The watchdog auto-stops after 30s without speech or 5 min max recording duration
-- To manually recover: `pkill -9 -f dictate.py` then restart
+Add `WhisperDictate.app` (not Terminal or raw Python) to **Accessibility**. Re-run `bash install.sh` to refresh the bundle.
 
 ### Hotkey not working
-- Ensure Accessibility permission is granted to **WhisperDictate.app**
-- Check if another app is using Ctrl+Space
-- Make sure you launched via `open WhisperDictate.app` or the launcher script
+- Confirm Accessibility is granted to **WhisperDictate.app**
+- Check if another app has Ctrl+Space bound (Spotlight uses Cmd+Space, but extensions sometimes hijack Ctrl+Space)
+- `~/bin/run_whisper_dictate.sh status` — confirms launchd has it loaded
 
-### Multiple instances running
+### Audio level too low
+- Verify Microphone permission for **WhisperDictate**
+- `~/bin/run_whisper_dictate.sh logs` — the log lists every input device at startup; confirm the right one is `default`
+
+### Microphone stuck / locked
+The self-heal should catch this automatically. If it ever doesn't:
+
 ```bash
-pkill -9 -f dictate.py
+~/bin/run_whisper_dictate.sh stop
+sudo killall coreaudiod   # nuclear: respawns instantly, releases stale audio handles
 ~/bin/run_whisper_dictate.sh start
 ```
 
-### View detailed logs
+### Multiple instances
+The single-instance lock (`~/whisper-dictate/.dictate.pid`) prevents this, but if you suspect a stale state:
+
+```bash
+~/bin/run_whisper_dictate.sh stop
+pkill -9 -f dictate.py
+rm -f ~/whisper-dictate/.dictate.pid
+~/bin/run_whisper_dictate.sh start
+```
+
+### Detailed logs
 ```bash
 tail -f ~/whisper-dictate/dictate.log
 ```
@@ -172,4 +191,4 @@ MIT
 
 ## Credits
 
-Built with [OpenAI Whisper](https://github.com/openai/whisper)
+Built with [OpenAI Whisper](https://github.com/openai/whisper).

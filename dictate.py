@@ -164,18 +164,10 @@ def _release_single_instance_lock():
 # ============================================================================
 # Permission Checks
 # ============================================================================
-def check_accessibility_permission():
-    """Check if Accessibility permission is granted (macOS)"""
-    try:
-        # Try to create a keyboard listener - this will fail without permission
-        test_listener = keyboard.Listener(on_press=lambda k: None)
-        test_listener.start()
-        time.sleep(0.1)
-        test_listener.stop()
-        return True
-    except Exception as e:
-        logger.error(f"Accessibility check failed: {e}")
-        return False
+# Note: there's no reliable programmatic Accessibility check on macOS — pynput
+# silently degrades when not granted (events arrive but Cmd+V doesn't fire).
+# The user-facing signal is the "(text pasted if Accessibility permission
+# granted)" log line in type_text. We only verify Microphone here.
 
 def check_microphone_permission():
     """Check if Microphone permission is granted"""
@@ -208,24 +200,19 @@ def print_permission_instructions():
     print("=" * 60 + "\n")
 
 def verify_permissions():
-    """Verify all required permissions are granted"""
-    logger.info("Checking permissions...")
+    """Verify all required permissions are granted.
 
-    # Check microphone first (less intrusive test)
+    Only Microphone is checked here — see comment above check_microphone_permission
+    for why Accessibility isn't programmatically verifiable.
+    """
+    logger.info("Checking permissions...")
     mic_ok = check_microphone_permission()
     if mic_ok:
         logger.info("Microphone permission: OK")
     else:
         logger.warning("Microphone permission: DENIED")
-
-    # Check accessibility (will show warning in console if denied)
-    # We check this by observing if pynput prints the "not trusted" warning
-    acc_ok = True  # We'll verify this differently
-
-    if not mic_ok:
         print_permission_instructions()
         return False
-
     return True
 
 # ============================================================================

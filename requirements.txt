@@ -1,4 +1,7 @@
-openai-whisper
-sounddevice
-numpy
-pynput
+# Pinned to known-working versions installed and tested on macOS.
+# openai-whisper uses date-based versioning, so pin exactly.
+# Others use semver — allow patch upgrades but cap major to prevent breakage.
+openai-whisper==20250625
+sounddevice>=0.5.4,<0.6
+numpy>=2.3.0,<3.0
+pynput>=1.8.1,<2.0

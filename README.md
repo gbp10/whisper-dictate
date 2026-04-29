@@ -95,7 +95,9 @@ The 1-second debounce prevents key-repeat from accidentally toggling twice.
 ~/bin/run_whisper_dictate.sh logs
 ```
 
-> **If you previously added WhisperDictate to System Settings > Login Items, REMOVE it.** launchd's `RunAtLoad` handles auto-start now; both running together produces duplicate processes (the second one fails the single-instance lock and exits, but it's noisy).
+> **About System Settings > General > Login Items & Extensions:** modern macOS shows launchd agents alongside user-added Login Items in the same list (look for the green "exec" icon). After installation, you'll see a `WhisperDictate` entry there — **that IS the launchd agent we just installed**. Leave it ON; that's what makes auto-start work.
+>
+> **Only remove an entry if you have TWO `WhisperDictate` rows** — one from a previous manual add via "Add Item", and one from the launchd agent. In that case, remove the manually-added one, because both running together would race on the audio stream (the second instance hits the single-instance lock and exits, but it's noisy in the log).
 
 ## Configuration
 

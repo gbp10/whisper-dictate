@@ -51,12 +51,14 @@ KEYCODE_SPACE = 49
 KEYCODE_CTRL_LEFT = 59
 KEYCODE_CTRL_RIGHT = 62
 
-# Known Whisper hallucinations (model artifacts from training data, not real transcriptions)
+# Known Whisper hallucinations (model artifacts from training data, not real transcriptions).
+# Match is whitespace- and punctuation-insensitive — Whisper produces these with
+# wildly varying punctuation ("Thanks for watching!", "thanks for watching...")
+# so a normalized comparison catches all variants from a single canonical entry.
 HALLUCINATION_PATTERNS = [
-    "transcribe spoken english accurately with proper punctuation.",
     "transcribe spoken english accurately with proper punctuation",
-    "transcribed by https://otter.ai",
-    "otter.ai",
+    "transcribed by https otter ai",  # URLs lose punctuation when normalized
+    "otter ai",
     "thanks for watching",
     "thank you for watching",
     "subscribe to my channel",
@@ -68,8 +70,13 @@ HALLUCINATION_PATTERNS = [
     "you",
     "bye",
     "bye bye",
-    "bye-bye",
 ]
+
+def _normalize_for_match(s):
+    """Lowercase, strip punctuation, collapse whitespace — for hallucination compare."""
+    return re.sub(r"\s+", " ", re.sub(r"[^\w\s]", " ", s.lower())).strip()
+
+_NORMALIZED_HALLUCINATIONS = frozenset(_normalize_for_match(p) for p in HALLUCINATION_PATTERNS)
 
 # Logging configuration
 LOG_FILE = Path.home() / "whisper-dictate" / "dictate.log"
@@ -328,8 +335,8 @@ class WhisperDictate:
             logger.warning("No speech detected (after prompt stripping)")
             return
 
-        # Filter out known Whisper hallucinations
-        if text.lower() in HALLUCINATION_PATTERNS:
+        # Filter out known Whisper hallucinations (normalized compare)
+        if _normalize_for_match(text) in _NORMALIZED_HALLUCINATIONS:
             logger.warning(f"Filtered hallucination: {text}")
             return
 
@@ -639,9 +646,12 @@ class WhisperDictate:
             if not is_space and hasattr(key, 'vk') and key.vk == 49:
                 is_space = True
 
+            # Two independent ifs (matching on_press) — a single key event can't
+            # be both ctrl and space, so functionally identical to elif, but
+            # keeping both branches symmetric to on_press avoids future confusion.
             if is_ctrl:
                 self._ctrl_held = False
-            elif is_space:
+            if is_space:
                 self._space_held = False
         except Exception as e:
             logger.error(f"Key release error: {e}")
@@ -682,30 +692,20 @@ class WhisperDictate:
         signal.signal(signal.SIGINT, self.cleanup)
         signal.signal(signal.SIGTERM, self.cleanup)
 
+        # Banner — logger handles both file (always) and console (when TTY).
+        # No separate print() needed; under launchd, stdout is captured to
+        # dictate.stdout.log via the plist's StandardOutPath.
         logger.info("=" * 50)
         logger.info("Whisper Dictate Ready!")
         logger.info("=" * 50)
-        logger.info(f"Hotkey: Press Ctrl+Space to toggle recording")
-        logger.info(f"Mode: Toggle (press to start, press again to stop)")
+        logger.info("Hotkey: Press Ctrl+Space to toggle recording")
+        logger.info("Mode: Toggle (press once to start, press again to stop)")
         logger.info(f"Model: {MODEL_NAME}")
         logger.info(f"Language: {'Auto-detect' if LANGUAGE is None else LANGUAGE}")
-        logger.info(f"Async transcription: enabled")
+        logger.info("Async transcription: enabled")
         logger.info(f"Hard timeout: {WATCHDOG_MAX_RECORDING_SECONDS}s")
         logger.info("Press Ctrl+C to quit")
         logger.info("=" * 50)
-
-        # Print to console as well for visibility
-        print("\n" + "=" * 50)
-        print("Whisper Dictate Ready!")
-        print("=" * 50)
-        print(f"Hotkey: Press Ctrl+Space to toggle recording")
-        print(f"  - Press once to START recording")
-        print(f"  - Press again to STOP recording")
-        print(f"Model: {MODEL_NAME}")
-        print(f"Language: {'Auto-detect' if LANGUAGE is None else LANGUAGE}")
-        print(f"Hard timeout: {WATCHDOG_MAX_RECORDING_SECONDS}s")
-        print("Press Ctrl+C to quit")
-        print("=" * 50 + "\n")
 
         self.listener = keyboard.Listener(
             on_press=self.on_press,

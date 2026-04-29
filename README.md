@@ -109,7 +109,7 @@ Edit `~/whisper-dictate/dictate.py`, then `~/bin/run_whisper_dictate.sh restart`
 | `LANGUAGE` | `en` | Set to `None` for auto-detect, or `"es"`, `"fr"`, etc. |
 | `SILENCE_THRESHOLD` | `0.001` | Lower = more aggressive silence trim |
 | `MIN_RECORDING_SECONDS` | `0.5` | Reject taps shorter than this (anti-hallucination) |
-| `WATCHDOG_MAX_RECORDING_SECONDS` | `120` | Hard max recording duration; auto-stops if you forget to toggle |
+| `WATCHDOG_MAX_RECORDING_SECONDS` | `300` | Hard max recording duration (5 min); auto-stops if you forget to toggle |
 | `LOG_MAX_BYTES` | `1048576` (1 MB) | Rotate at this size |
 | `LOG_BACKUP_COUNT` | `3` | Keep this many rotated logs |
 | `TOGGLE_DEBOUNCE_SECONDS` | `1.0` | Min time between toggles (prevents key-repeat double-fires) |

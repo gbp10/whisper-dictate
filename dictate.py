@@ -42,7 +42,7 @@ MIN_RECORDING_SECONDS = 0.5  # Ignore recordings shorter than this (prevents hal
 # Whisper initial_prompt conditions the model's style. It can leak into output, so we
 # store it as a constant and strip it from transcriptions if detected.
 WHISPER_INITIAL_PROMPT = "Transcribe spoken English accurately with proper punctuation."
-WATCHDOG_MAX_RECORDING_SECONDS = 120  # Hard max recording duration (2 min safety net)
+WATCHDOG_MAX_RECORDING_SECONDS = 300  # Hard max recording duration (5 min safety net)
 SOUND_START = "/System/Library/Sounds/Tink.aiff"  # Played when recording starts
 SOUND_STOP = "/System/Library/Sounds/Pop.aiff"  # Played when recording stops
 WATCHDOG_LOG_INTERVAL = 10  # Log watchdog status every N seconds during recording

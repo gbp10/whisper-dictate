@@ -323,8 +323,11 @@ class WhisperDictate:
         audio_level = np.abs(audio).mean()
         logger.info(f"Audio level: {audio_level:.6f} (duration: {duration:.2f}s)")
 
-        if audio_level < 0.0001:
-            logger.warning("Audio level too low - check microphone permissions or input device")
+        # 0.001 chosen empirically: real speech in this user's logs ranges
+        # 0.0015–0.005, while noise/silence segments that produced hallucinations
+        # came in at ~0.0004. 0.001 cleanly separates them with margin.
+        if audio_level < 0.001:
+            logger.warning(f"Audio level too low ({audio_level:.6f}) — likely silence/noise, skipping")
             return
 
         # Trim silence
@@ -412,12 +415,22 @@ class WhisperDictate:
                     self._flush_segment_locked()
 
     def _flush_segment_locked(self):
-        """Move the current segment to the transcription queue. Caller MUST hold _segment_lock."""
+        """Move the current segment to the transcription queue. Caller MUST hold _segment_lock.
+
+        Drops segments that have less than MIN_SEGMENT_SPEECH_SECONDS of speech.
+        Without this guard, a buffer that accumulated 8s of silence + one tiny
+        background-noise blip would still get transcribed (because speech_frames > 0),
+        and Whisper would hallucinate text on near-silence — observed in production
+        as "See description for the correct punctuation" appearing after the user
+        stopped speaking but before pressing toggle-stop.
+        """
         if not self._segment_buffer:
             return
-        if self._segment_speech_frames == 0:
-            # Buffer holds only silence (e.g., before user starts talking) — drop it
+        speech_secs = self._segment_speech_frames / SAMPLE_RATE
+        if speech_secs < MIN_SEGMENT_SPEECH_SECONDS:
+            # Not enough speech — drop the buffer (likely silence + noise blip)
             self._segment_buffer = []
+            self._segment_speech_frames = 0
             self._silence_frames = 0
             return
 

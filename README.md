@@ -156,6 +156,7 @@ Add `WhisperDictate.app` (not Terminal or raw Python) to **Accessibility**. Re-r
 - Confirm Accessibility is granted to **WhisperDictate.app**
 - Check if another app has Ctrl+Space bound (Spotlight uses Cmd+Space, but extensions sometimes hijack Ctrl+Space)
 - `~/bin/run_whisper_dictate.sh status` — confirms launchd has it loaded
+- **After re-running `install.sh`**: macOS TCC may invalidate the Accessibility/Microphone grant when an unsigned app's binary hash changes. In System Settings > Privacy & Security, toggle the corresponding permission OFF then ON for WhisperDictate.
 
 ### Audio level too low
 - Verify Microphone permission for **WhisperDictate**

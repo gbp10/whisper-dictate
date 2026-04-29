@@ -545,11 +545,20 @@ class WhisperDictate:
         audio_data = self.audio_data
         self.audio_data = []
 
-        threading.Thread(
-            target=self._cleanup_after_stop,
-            args=(audio_data,),
-            daemon=True,
-        ).start()
+        # If thread spawn fails (resource exhaustion is the only realistic
+        # cause), fall back to inline cleanup. The pynput listener blocks
+        # for the duration, but that's far better than leaking the stream
+        # — the existing 120s recording watchdog requires recording=True
+        # and can't catch an orphaned-stream-with-recording-False state.
+        try:
+            threading.Thread(
+                target=self._cleanup_after_stop,
+                args=(audio_data,),
+                daemon=True,
+            ).start()
+        except Exception as e:
+            logger.error(f"Failed to spawn cleanup thread: {e!r} — running inline")
+            self._cleanup_after_stop(audio_data)
 
     def _cleanup_after_stop(self, audio_data):
         """Release the stream and queue transcription. Runs in a worker thread."""

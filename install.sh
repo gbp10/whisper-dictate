@@ -42,10 +42,19 @@ if [ ! -f "$INSTALL_DIR/dictate.py" ]; then
     git clone "$REPO_URL" "$INSTALL_DIR"
 else
     echo "Whisper Dictate repo found at $INSTALL_DIR"
-    # Pull latest changes if it's a git repo
+    # Pull latest changes if it's a git repo. Surface failures (don't swallow):
+    # local changes, conflicts, or network problems should be visible — they
+    # mean the user is about to install stale code without knowing.
     if [ -d "$INSTALL_DIR/.git" ]; then
         echo "Updating to latest version..."
-        git -C "$INSTALL_DIR" pull --ff-only 2>/dev/null || true
+        if ! git -C "$INSTALL_DIR" pull --ff-only; then
+            echo ""
+            echo "WARNING: git pull failed. Common causes: uncommitted local changes,"
+            echo "non-fast-forward divergence, or network. Continuing with current"
+            echo "checkout — re-run after resolving with:"
+            echo "  cd $INSTALL_DIR && git status"
+            echo ""
+        fi
     fi
 fi
 
@@ -255,6 +264,12 @@ echo "REMOVE it now — otherwise you'll get duplicate processes."
 echo ""
 echo "Self-heal: if the audio stream ever hangs, the process exits with code 75"
 echo "and launchd respawns it automatically (no more stuck mic forever)."
+echo ""
+echo "If the hotkey or paste stops working after this upgrade:"
+echo "  macOS TCC may invalidate Accessibility/Microphone grants when an"
+echo "  unsigned app's binary changes. Re-toggle in System Settings:"
+echo "  Privacy & Security > Accessibility > WhisperDictate (off, then on)"
+echo "  Privacy & Security > Microphone > WhisperDictate (off, then on)"
 echo ""
 echo "Usage: Press Ctrl+Space to start recording. Press again to stop and paste."
 echo ""

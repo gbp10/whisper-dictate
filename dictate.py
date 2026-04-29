@@ -9,22 +9,26 @@ Requirements:
 - macOS Microphone permission for the terminal/Python app
 """
 
+import atexit
+import fcntl
+import logging
+import multiprocessing
 import os
-import sys
+import queue
+import re
 import signal
 import subprocess
-import numpy as np
-import sounddevice as sd
-from pynput import keyboard
-from pynput.keyboard import Controller as KeyboardController
-import whisper
+import sys
+import threading
 import time
-import logging
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
-import multiprocessing
-import threading
-import queue
+
+import numpy as np
+import sounddevice as sd
+import whisper
+from pynput import keyboard
+from pynput.keyboard import Controller as KeyboardController
 
 # ============================================================================
 # Configuration
@@ -72,6 +76,9 @@ LOG_FILE = Path.home() / "whisper-dictate" / "dictate.log"
 LOG_MAX_BYTES = 1 * 1024 * 1024  # 1 MB max log size
 LOG_BACKUP_COUNT = 3  # Keep 3 backup logs
 
+# Single-instance lockfile — prevents double-launch (e.g., launchd + stale Login Items entry)
+PID_FILE = Path.home() / "whisper-dictate" / ".dictate.pid"
+
 # ============================================================================
 # Logging Setup with Rotation
 # ============================================================================
@@ -115,6 +122,44 @@ def setup_logging():
     return logger
 
 logger = setup_logging()
+
+# ============================================================================
+# Single-Instance Lock
+# ============================================================================
+_pid_lock_handle = None  # module-level so the fd stays open for the process lifetime
+
+def acquire_single_instance_lock():
+    """Refuse to start if another instance already holds the lock.
+
+    Uses fcntl.flock (advisory lock). The kernel releases the lock automatically
+    when the process dies — including via os._exit(75) for the stuck-mic recovery
+    path — so there's no cleanup race even on hard exit.
+    """
+    global _pid_lock_handle
+    PID_FILE.parent.mkdir(parents=True, exist_ok=True)
+    _pid_lock_handle = open(PID_FILE, "w")
+    try:
+        fcntl.flock(_pid_lock_handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        try:
+            existing = Path(PID_FILE).read_text().strip()
+        except Exception:
+            existing = "unknown"
+        logger.error(f"Another whisper-dictate instance is already running (PID {existing}). Exiting.")
+        sys.exit(1)
+    _pid_lock_handle.write(f"{os.getpid()}\n")
+    _pid_lock_handle.flush()
+    atexit.register(_release_single_instance_lock)
+
+def _release_single_instance_lock():
+    if _pid_lock_handle is None:
+        return
+    try:
+        fcntl.flock(_pid_lock_handle.fileno(), fcntl.LOCK_UN)
+        _pid_lock_handle.close()
+        PID_FILE.unlink(missing_ok=True)
+    except Exception:
+        pass
 
 # ============================================================================
 # Permission Checks
@@ -369,12 +414,15 @@ class WhisperDictate:
             pass  # Sound is non-critical, never block on failure
 
     def _force_release_stream(self):
-        """Force-close the audio stream and release the mic.
+        """Close the audio stream with a timeout, exiting if PortAudio hangs.
 
-        Uses a timeout thread because PortAudio stop/close can hang
-        if the device is in a bad state (disconnected, driver stall, etc.).
-        When the timeout fires, reinitializes sounddevice to force-release
-        the mic at the OS level.
+        PortAudio's stop/close can hang in pathological states (device
+        disconnect, driver stall). Calling sd._terminate() to recover
+        deadlocks against the in-flight close — we observed this in
+        production: the process hung for 23 minutes holding the mic.
+        Instead, on hang we exit with EX_TEMPFAIL (75); launchd's
+        KeepAlive (SuccessfulExit=false) respawns us, which is the only
+        reliable way to release the mic from the OS at that point.
         """
         stream = self.stream
         self.stream = None
@@ -396,13 +444,17 @@ class WhisperDictate:
         closer.start()
         closer.join(timeout=3.0)
         if closer.is_alive():
-            logger.warning("Stream close timed out after 3s — forcing PortAudio reset")
-            try:
-                sd._terminate()
-                sd._initialize()
-                logger.info("PortAudio reset complete — mic should be released")
-            except Exception as e:
-                logger.error(f"PortAudio reset failed: {e}")
+            logger.error(
+                "Stream close hung — exiting with code 75 so launchd respawns. "
+                "Mic will be released by the kernel on process death."
+            )
+            # os._exit skips atexit/logging flush; flush handlers manually first
+            for h in logger.handlers:
+                try:
+                    h.flush()
+                except Exception:
+                    pass
+            os._exit(75)
 
     # ========================================================================
     # Watchdog (runs on main thread)
@@ -481,23 +533,34 @@ class WhisperDictate:
         self._recording_start_time = None
 
     def stop_recording(self):
-        """Stop recording and queue audio for async transcription."""
+        """Stop recording and hand cleanup off to a background thread.
+
+        Cleanup runs off pynput's listener thread so that a stream-close
+        hang cannot freeze the keyboard listener (which would lock the
+        user out of even quitting via the hotkey). If close hangs, the
+        cleanup thread triggers os._exit(75) and launchd respawns us.
+        """
         if not self.recording:
             return
         self.recording = False
         self._recording_start_time = None
 
         self._play_sound(SOUND_STOP)
-        logger.info("Stopped recording. Releasing mic...")
+        logger.info("Stopped recording. Releasing mic in background...")
 
-        # Force-release the mic stream (with timeout to prevent hangs)
-        self._force_release_stream()
-
-        logger.info("Mic released.")
-
-        # Grab the audio data and queue it for async transcription
         audio_data = self.audio_data
         self.audio_data = []
+
+        threading.Thread(
+            target=self._cleanup_after_stop,
+            args=(audio_data,),
+            daemon=True,
+        ).start()
+
+    def _cleanup_after_stop(self, audio_data):
+        """Release the stream and queue transcription. Runs in a worker thread."""
+        self._force_release_stream()
+        logger.info("Mic released.")
         if audio_data:
             self._transcription_queue.put(audio_data)
         else:
@@ -682,6 +745,10 @@ if __name__ == "__main__":
 
     logger.info("Starting Whisper Dictate...")
     logger.info(f"Log file: {LOG_FILE}")
+
+    # Acquire single-instance lock BEFORE loading the model (which is expensive).
+    # If another copy is running we exit fast rather than waste 5-10s on Whisper init.
+    acquire_single_instance_lock()
 
     # Verify permissions
     if not verify_permissions():
